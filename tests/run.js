@@ -249,6 +249,134 @@ async function main() {
     record('stage2: glider moves (+1,+1) per 4 generations', ok);
   }
 
+  // ---- Stage 3: display + camera ----
+  {
+    const ALIVE = [235, 240, 255];
+    const DEAD = [11, 11, 16];
+    const near = (got, want) => Math.abs(got[0] - want[0]) <= 8 && Math.abs(got[1] - want[1]) <= 8 && Math.abs(got[2] - want[2]) <= 8;
+
+    const screenAt = (p, wx, wy) => p.evaluate(([wx, wy]) => {
+      const L = window.__life;
+      const c = document.querySelector('canvas');
+      const v = L.view();
+      const px = Math.floor((wx - v[0]) / v[2] * c.width);
+      const py = Math.floor((wy - v[1]) / v[3] * c.height);
+      const b = L.readScreen(px, py, 1, 1);
+      return [b[0], b[1], b[2]];
+    }, [wx, wy]);
+
+    await seedGrid(page, [[10, 10], [11, 10], [10, 11], [11, 11]]);
+    const alivePx = await screenAt(page, 10.5, 10.5);
+    const deadPx = await screenAt(page, 30.5, 30.5);
+    record('stage3: grid visible, cells distinguishable', near(alivePx, ALIVE) && near(deadPx, DEAD), `alive=${alivePx} dead=${deadPx}`);
+
+    // zoom-to-cursor: the world point under the cursor must not move
+    await page.mouse.move(200, 150);
+    const worldUnder = () => page.evaluate(() => {
+      const L = window.__life;
+      const c = document.querySelector('canvas');
+      const v = L.view();
+      const ux = 200 / c.clientWidth;
+      const uy = 1 - 150 / c.clientHeight;
+      return { wx: v[0] + ux * v[2], wy: v[1] + uy * v[3], cellsX: v[2] };
+    });
+    const before = await worldUnder();
+    await page.mouse.wheel(0, -240);
+    const after = await worldUnder();
+    record(
+      'stage3: zoom-to-cursor keeps world point fixed',
+      Math.abs(after.wx - before.wx) < 1e-6 && Math.abs(after.wy - before.wy) < 1e-6 && after.cellsX < before.cellsX,
+      `cellsX ${before.cellsX.toFixed(2)} -> ${after.cellsX.toFixed(2)}`,
+    );
+
+    // zoom grows the on-screen width of a seeded column
+    const bar = [];
+    for (let y = 0; y < SIZE; y++) bar.push([32, y]);
+    await seedGrid(page, bar);
+    const runLength = () => page.evaluate(() => {
+      const L = window.__life;
+      const c = document.querySelector('canvas');
+      const b = L.readScreen(0, Math.floor(c.height / 2), c.width, 1);
+      let min = -1;
+      let max = -1;
+      for (let i = 0; i < c.width; i++) {
+        if (b[i * 4] > 128) {
+          if (min < 0) min = i;
+          max = i;
+        }
+      }
+      return max >= 0 ? max - min + 1 : 0;
+    });
+    const runBefore = await runLength();
+    await page.mouse.wheel(0, -240);
+    const runAfter = await runLength();
+    record('stage3: zoom-in widens cells on screen', runAfter > runBefore, `${runBefore}px -> ${runAfter}px`);
+
+    // pan: drag (400,300) -> (450,320) must move the origin by the expected delta
+    const v0 = await page.evaluate(() => window.__life.view());
+    const dims = await page.evaluate(() => {
+      const c = document.querySelector('canvas');
+      return [c.clientWidth, c.clientHeight];
+    });
+    await page.mouse.move(400, 300);
+    await page.mouse.down();
+    await page.mouse.move(450, 320);
+    await page.mouse.up();
+    const v1 = await page.evaluate(() => window.__life.view());
+    const expX = v0[0] - (50 / dims[0]) * v0[2];
+    const expY = v0[1] + (20 / dims[1]) * v0[3];
+    record(
+      'stage3: drag pan moves camera by expected delta',
+      Math.abs(v1[0] - expX) < 1e-4 && Math.abs(v1[1] - expY) < 1e-4,
+      `origin (${v0[0].toFixed(2)},${v0[1].toFixed(2)}) -> (${v1[0].toFixed(2)},${v1[1].toFixed(2)})`,
+    );
+
+    // resize after interaction keeps the camera
+    const camBefore = await page.evaluate(() => window.__life.view());
+    await page.setViewportSize({ width: 900, height: 500 });
+    await page.waitForTimeout(200);
+    const camAfter = await page.evaluate(() => window.__life.view());
+    record('stage3: resize keeps camera after interaction', [0, 1, 2].every((i) => Math.abs(camBefore[i] - camAfter[i]) < 1e-9));
+
+    // resize while untouched refits the view
+    const page4 = await browser.newPage({ viewport: { width: 1024, height: 1024 } });
+    await page4.goto(`${base}?size=${SIZE}&sps=0.0001`);
+    await page4.waitForFunction(() => !!window.__life);
+    await page4.setViewportSize({ width: 640, height: 480 });
+    await page4.waitForTimeout(200);
+    const vRefit = await page4.evaluate(() => window.__life.view());
+    const refitOk = Math.abs(vRefit[2] - SIZE) < 1e-6 && Math.abs(vRefit[0]) < 1e-6 && Math.abs(vRefit[1] - (SIZE / 2 - vRefit[3] / 2)) < 1e-6;
+    record('stage3: resize refits while untouched', refitOk, JSON.stringify(vRefit.map((n) => +n.toFixed(3))));
+    await page4.close();
+
+    // 4096 display-only smoke: FPS must stay in the same class as a tiny grid.
+    // Absolute FPS under software GL (SwiftShader) is environment-dependent and
+    // is measured properly in Stage 5; here we assert 4096 does not tank vs 64.
+    const measureFps = async (size) => {
+      const p = await browser.newPage({ viewport: { width: 1024, height: 1024 } });
+      await p.addInitScript(() => {
+        window.__counters = { drawArrays: 0 };
+        const origDraw = WebGL2RenderingContext.prototype.drawArrays;
+        WebGL2RenderingContext.prototype.drawArrays = function () { window.__counters.drawArrays++; return origDraw.apply(this, arguments); };
+      });
+      await p.goto(`${base}?size=${size}&sps=0.0001`);
+      await p.waitForFunction(() => !!window.__life);
+      await p.waitForTimeout(400);
+      const d0 = await p.evaluate(() => window.__counters.drawArrays);
+      await p.waitForTimeout(2000);
+      const d1 = await p.evaluate(() => window.__counters.drawArrays);
+      await p.close();
+      return (d1 - d0) / 2;
+    };
+    const fpsBase = await measureFps(64);
+    const fps4k = await measureFps(4096);
+    record(
+      'stage3: 4096 display FPS in same class as small grid',
+      fps4k >= fpsBase * 0.6,
+      `fps@64=${fpsBase.toFixed(1)} fps@4096=${fps4k.toFixed(1)}`,
+    );
+  }
+
   // ---- Loop hygiene with auto stepping on (second page) ----
   {
     const page2 = await browser.newPage({ viewport: { width: 800, height: 600 } });

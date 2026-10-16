@@ -70,8 +70,8 @@ function createSimTargets(size) {
     gl.bindTexture(gl.TEXTURE_2D, texture);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, size, size, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
 
     const fbo = gl.createFramebuffer();
@@ -91,35 +91,28 @@ function createSimTargets(size) {
   return { textures: textures, fbos: fbos };
 }
 
-function resize() {
-  const dpr = window.devicePixelRatio || 1;
-  const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
-  const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
-  if (canvas.width !== w || canvas.height !== h) {
-    canvas.width = w;
-    canvas.height = h;
-  }
-}
-
 const MAX_STEPS_PER_FRAME = 8;
 
 async function main() {
   const sources = await Promise.all([
     loadText('shaders/sim.vert.glsl'),
     loadText('shaders/sim.frag.glsl'),
-    loadText('shaders/present.frag.glsl'),
+    loadText('shaders/display.frag.glsl'),
   ]);
   const simProgram = linkProgram(sources[0], sources[1]);
-  const presentProgram = linkProgram(sources[0], sources[2]);
+  const displayProgram = linkProgram(sources[0], sources[2]);
 
   const simLoc = {
     uState: gl.getUniformLocation(simProgram, 'uState'),
     uSize: gl.getUniformLocation(simProgram, 'uSize'),
     uWrap: gl.getUniformLocation(simProgram, 'uWrap'),
   };
-  const presentLoc = {
-    uState: gl.getUniformLocation(presentProgram, 'uState'),
-    uViewSize: gl.getUniformLocation(presentProgram, 'uViewSize'),
+  const displayLoc = {
+    uState: gl.getUniformLocation(displayProgram, 'uState'),
+    uViewSize: gl.getUniformLocation(displayProgram, 'uViewSize'),
+    uOrigin: gl.getUniformLocation(displayProgram, 'uOrigin'),
+    uCells: gl.getUniformLocation(displayProgram, 'uCells'),
+    uGrid: gl.getUniformLocation(displayProgram, 'uGrid'),
   };
 
   const size = gridSize();
@@ -128,6 +121,35 @@ async function main() {
   const fbos = targets.fbos;
   let read = 0;
   let write = 1;
+
+  let camX = 0;
+  let camY = 0;
+  let cellsX = size;
+  let userInteracted = 0;
+  let isDragging = 0;
+  let dragLastX = 0;
+  let dragLastY = 0;
+
+  function cellsY() {
+    return cellsX * gl.drawingBufferHeight / gl.drawingBufferWidth;
+  }
+
+  function fitView() {
+    cellsX = size;
+    camX = 0;
+    camY = size / 2 - cellsY() / 2;
+  }
+
+  function resize() {
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
+    const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
+    }
+    if (!userInteracted) fitView();
+  }
 
   const spsParam = Number(new URLSearchParams(location.search).get('sps'));
   const stepsPerSecond = Number.isFinite(spsParam) && spsParam > 0 ? spsParam : 10;
@@ -149,15 +171,55 @@ async function main() {
     write ^= 1;
   }
 
-  function present() {
+  function display() {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
-    gl.useProgram(presentProgram);
+    gl.useProgram(displayProgram);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, textures[read]);
-    gl.uniform1i(presentLoc.uState, 0);
-    gl.uniform2f(presentLoc.uViewSize, gl.drawingBufferWidth, gl.drawingBufferHeight);
+    gl.uniform1i(displayLoc.uState, 0);
+    gl.uniform2f(displayLoc.uViewSize, gl.drawingBufferWidth, gl.drawingBufferHeight);
+    gl.uniform2f(displayLoc.uOrigin, camX, camY);
+    gl.uniform2f(displayLoc.uCells, cellsX, cellsY());
+    gl.uniform1f(displayLoc.uGrid, size);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+
+  function onWheel(e) {
+    e.preventDefault();
+    const ux = e.offsetX / canvas.clientWidth;
+    const uy = 1 - e.offsetY / canvas.clientHeight;
+    const cy = cellsY();
+    const wx = camX + ux * cellsX;
+    const wy = camY + uy * cy;
+    let next = cellsX * Math.pow(1.0015, e.deltaY);
+    const minCells = 4;
+    const maxCells = size * 4;
+    if (next < minCells) next = minCells;
+    if (next > maxCells) next = maxCells;
+    cellsX = next;
+    camX = wx - ux * cellsX;
+    camY = wy - uy * cellsY();
+    userInteracted = 1;
+  }
+
+  function onMouseDown(e) {
+    isDragging = 1;
+    dragLastX = e.offsetX;
+    dragLastY = e.offsetY;
+    userInteracted = 1;
+  }
+
+  function onMouseUp() {
+    isDragging = 0;
+  }
+
+  function onMouseMove(e) {
+    if (!isDragging) return;
+    camX -= ((e.offsetX - dragLastX) / canvas.clientWidth) * cellsX;
+    camY += ((e.offsetY - dragLastY) / canvas.clientHeight) * cellsY();
+    dragLastX = e.offsetX;
+    dragLastY = e.offsetY;
   }
 
   window.__life = {
@@ -181,9 +243,25 @@ async function main() {
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       return buf;
     },
+    view: function () {
+      return [camX, camY, cellsX, cellsY()];
+    },
+    readScreen: function (x, y, w, h) {
+      display();
+      const buf = new Uint8Array(w * h * 4);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.readPixels(x, y, w, h, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+      return buf;
+    },
   };
 
   window.addEventListener('resize', resize);
+  canvas.addEventListener('wheel', onWheel, { passive: false });
+  canvas.addEventListener('mousedown', onMouseDown);
+  window.addEventListener('mouseup', onMouseUp);
+  window.addEventListener('mousemove', onMouseMove);
+
+  fitView();
   resize();
 
   function frame(now) {
@@ -204,7 +282,7 @@ async function main() {
         accumulator = 0;
       }
     }
-    present();
+    display();
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);
