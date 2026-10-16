@@ -1,0 +1,12 @@
+{
+  "name": "conways",
+  "private": true,
+  "description": "Conway's Game of Life (B3/S23) in WebGL2. The app has zero runtime dependencies; playwright-core is a dev dependency of the test harness only.",
+  "type": "commonjs",
+  "scripts": {
+    "test": "node tests/run.js"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.64.1"
+  }
+}
