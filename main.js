@@ -101,22 +101,110 @@ function resize() {
   }
 }
 
+const MAX_STEPS_PER_FRAME = 8;
+
 async function main() {
-  const [vertexSource, fragmentSource] = await Promise.all([
-    loadText('shaders/clear.vert.glsl'),
-    loadText('shaders/clear.frag.glsl'),
+  const sources = await Promise.all([
+    loadText('shaders/sim.vert.glsl'),
+    loadText('shaders/sim.frag.glsl'),
+    loadText('shaders/present.frag.glsl'),
   ]);
-  const program = linkProgram(vertexSource, fragmentSource);
+  const simProgram = linkProgram(sources[0], sources[1]);
+  const presentProgram = linkProgram(sources[0], sources[2]);
+
+  const simLoc = {
+    uState: gl.getUniformLocation(simProgram, 'uState'),
+    uSize: gl.getUniformLocation(simProgram, 'uSize'),
+    uWrap: gl.getUniformLocation(simProgram, 'uWrap'),
+  };
+  const presentLoc = {
+    uState: gl.getUniformLocation(presentProgram, 'uState'),
+    uViewSize: gl.getUniformLocation(presentProgram, 'uViewSize'),
+  };
+
   const size = gridSize();
-  createSimTargets(size);
+  const targets = createSimTargets(size);
+  const textures = targets.textures;
+  const fbos = targets.fbos;
+  let read = 0;
+  let write = 1;
+
+  const spsParam = Number(new URLSearchParams(location.search).get('sps'));
+  const stepsPerSecond = Number.isFinite(spsParam) && spsParam > 0 ? spsParam : 10;
+  let auto = true;
+  let lastTime = -1;
+  let accumulator = 0;
+
+  function stepOnce() {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbos[write]);
+    gl.viewport(0, 0, size, size);
+    gl.useProgram(simProgram);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, textures[read]);
+    gl.uniform1i(simLoc.uState, 0);
+    gl.uniform1i(simLoc.uSize, size);
+    gl.uniform1i(simLoc.uWrap, 1);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    read = write;
+    write ^= 1;
+  }
+
+  function present() {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+    gl.useProgram(presentProgram);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, textures[read]);
+    gl.uniform1i(presentLoc.uState, 0);
+    gl.uniform2f(presentLoc.uViewSize, gl.drawingBufferWidth, gl.drawingBufferHeight);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+
+  window.__life = {
+    size: size,
+    setAuto: function (value) {
+      auto = !!value;
+      accumulator = 0;
+    },
+    step: function (n) {
+      for (let i = 0; i < n; i++) stepOnce();
+    },
+    seed: function (w, h, data) {
+      gl.bindTexture(gl.TEXTURE_2D, textures[read]);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, data);
+    },
+    read: function (x, y, w, h) {
+      const buf = new Uint8Array(w * h * 4);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbos[read]);
+      gl.readPixels(x, y, w, h, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      return buf;
+    },
+  };
 
   window.addEventListener('resize', resize);
   resize();
 
-  function frame() {
-    gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
-    gl.useProgram(program);
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  function frame(now) {
+    if (lastTime < 0) lastTime = now;
+    let dt = (now - lastTime) / 1000;
+    lastTime = now;
+    if (dt > 0) {
+      if (dt > 0.25) dt = 0.25;
+      accumulator += dt;
+      const stepDuration = 1 / stepsPerSecond;
+      let steps = 0;
+      while (accumulator >= stepDuration && steps < MAX_STEPS_PER_FRAME) {
+        stepOnce();
+        accumulator -= stepDuration;
+        steps++;
+      }
+      if (steps === MAX_STEPS_PER_FRAME && accumulator > stepDuration) {
+        accumulator = 0;
+      }
+    }
+    present();
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);
