@@ -9,10 +9,45 @@
     html, body { margin: 0; height: 100%; background: #0b0b10; overflow: hidden; }
     canvas { display: block; width: 100vw; height: 100vh; }
     #error { color: #ff6b6b; font: 14px/1.4 monospace; padding: 1em; white-space: pre-wrap; }
+    #toolbar {
+      position: fixed; top: 0; left: 0; z-index: 1;
+      display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+      padding: 6px 8px;
+      background: rgba(11, 11, 16, 0.88);
+      color: #e8ecff;
+      font: 12px/1.2 monospace;
+      border-bottom-right-radius: 6px;
+    }
+    #toolbar button, #toolbar select {
+      font: inherit; color: inherit; background: #1b1f2e;
+      border: 1px solid #333a52; border-radius: 4px; padding: 3px 6px;
+    }
+    #toolbar button { cursor: pointer; }
+    #toolbar label { display: flex; gap: 4px; align-items: center; }
   </style>
 </head>
 <body>
   <canvas id="gl"></canvas>
+  <div id="toolbar">
+    <button id="btn-play" data-action="play">Pause</button>
+    <button id="btn-step" data-action="step">Step</button>
+    <label>Speed <input id="speed" type="range" min="1" max="120" value="10"></label>
+    <label>Grid <select id="grid-size">
+      <option value="1024">1024</option>
+      <option value="2048">2048</option>
+      <option value="4096">4096</option>
+    </select></label>
+    <button id="btn-clear" data-action="clear">Clear</button>
+    <button id="btn-random" data-action="random">Randomize</button>
+    <button id="btn-paint" data-action="toggle-paint">Paint: off</button>
+    <label>Brush <input id="brush-size" type="range" min="1" max="64" value="5"></label>
+    <label>Pattern <select id="pattern">
+      <option value="brush">Brush</option>
+      <option value="glider">Glider</option>
+      <option value="blinker">Blinker</option>
+      <option value="gun">Gosper gun</option>
+    </select></label>
+  </div>
   <script type="module" src="main.js"></script>
 </body>
 </html>

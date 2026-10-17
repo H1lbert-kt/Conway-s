@@ -377,6 +377,275 @@ async function main() {
     );
   }
 
+  // ---- Stage 4: interaction, patterns, controls ----
+  {
+    await page.evaluate(() => {
+      window.__uploads = { texSubImage2D: 0, texImage2D: 0, deleteTexture: 0 };
+      const P = WebGL2RenderingContext.prototype;
+      for (const [name, key] of [['texSubImage2D', 'texSubImage2D'], ['texImage2D', 'texImage2D'], ['deleteTexture', 'deleteTexture']]) {
+        const orig = P[name];
+        P[name] = function () { window.__uploads[key]++; return orig.apply(this, arguments); };
+      }
+    });
+    const uploads = () => page.evaluate(() => window.__uploads);
+    const gen = () => page.evaluate(() => window.__life.generation());
+    const expectedTexel = (mx, my) => page.evaluate(([x, y]) => {
+      const c = document.querySelector('canvas');
+      const v = window.__life.view();
+      return [Math.floor(v[0] + (x / c.clientWidth) * v[2]), Math.floor(v[1] + (1 - y / c.clientHeight) * v[3])];
+    }, [mx, my]);
+    const wrapIdx = (x, y) => (((y % SIZE) + SIZE) % SIZE) * SIZE + (((x % SIZE) + SIZE) % SIZE);
+
+    // clear: single GPU upload, empty grid
+    await page.click('#btn-clear');
+    const upClear = await uploads();
+    const gridClear = await gpuGrid(page);
+    record('stage4: clear = 1 GPU upload, grid empty',
+      upClear.texSubImage2D === 1 && upClear.texImage2D === 0 && gridClear.every((v) => v === 0),
+      JSON.stringify(upClear));
+
+    // randomize: single GPU upload, mixed state
+    await page.click('#btn-random');
+    const upRand = await uploads();
+    const gridRand = await gpuGrid(page);
+    let alive0 = 0;
+    for (let i = 0; i < gridRand.length; i++) alive0 += gridRand[i];
+    const ratio = alive0 / gridRand.length;
+    record('stage4: randomize = 1 GPU upload, mixed state',
+      upRand.texSubImage2D === 2 && upRand.texImage2D === 0 && ratio > 0.3 && ratio < 0.7,
+      `uploads=${upRand.texSubImage2D} ratio=${ratio.toFixed(2)}`);
+
+    // step button (paused): generation +1, exact CPU match
+    const beforeStep = await gpuGrid(page);
+    const refStep = cpuStep(beforeStep, SIZE);
+    const g0 = await gen();
+    await page.click('#btn-step');
+    const g1 = await gen();
+    const afterStep = await gpuGrid(page);
+    record('stage4: step button = 1 exact generation',
+      g1 === g0 + 1 && countDiff(refStep, afterStep) === 0, `gen ${g0} -> ${g1}`);
+
+    // speed slider + play/pause drive stepping
+    await page.evaluate(() => {
+      const s = document.getElementById('speed');
+      s.value = '40';
+      s.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    const draws0 = await page.evaluate(() => window.__counters.drawArrays);
+    const gA = await gen();
+    await page.click('#btn-play');
+    await page.waitForTimeout(800);
+    const gB = await gen();
+    await page.click('#btn-play');
+    const draws1 = await page.evaluate(() => window.__counters.drawArrays);
+    const playLabel = await page.textContent('#btn-play');
+    record('stage4: speed slider + play/pause drive stepping',
+      gB - gA >= 5 && draws1 > draws0 && playLabel === 'Play',
+      `${gB - gA} gens/0.8s, label=${playLabel}`);
+
+    // paint via DOM at current camera (position A)
+    await page.click('#btn-clear');
+    await page.click('#btn-paint');
+    const posA = [320, 240];
+    const texA = await expectedTexel(posA[0], posA[1]);
+    await page.mouse.move(posA[0], posA[1]);
+    await page.mouse.down();
+    await page.mouse.up();
+    const gridA = await gpuGrid(page);
+    let okA = true;
+    for (let dy = -2; dy <= 2 && okA; dy++) {
+      for (let dx = -2; dx <= 2 && okA; dx++) {
+        if (gridA[wrapIdx(texA[0] + dx, texA[1] + dy)] !== 1) okA = false;
+      }
+    }
+    okA = okA && gridA[wrapIdx(texA[0] + 3, texA[1])] === 0 && gridA[wrapIdx(texA[0], texA[1] + 3)] === 0;
+    record('stage4: drag paints at camera position (DOM)', okA, `texel=(${texA[0]},${texA[1]})`);
+
+    // change camera (pan + zoom), paint at position B, cell A stays
+    await page.click('#btn-paint');
+    await page.mouse.move(500, 350);
+    await page.mouse.wheel(0, -200);
+    await page.mouse.down();
+    await page.mouse.move(560, 380);
+    await page.mouse.up();
+    await page.click('#btn-paint');
+    const posB = [640, 300];
+    const texB = await expectedTexel(posB[0], posB[1]);
+    await page.mouse.move(posB[0], posB[1]);
+    await page.mouse.down();
+    await page.mouse.up();
+    const gridB = await gpuGrid(page);
+    let okB = true;
+    for (let dy = -2; dy <= 2 && okB; dy++) {
+      for (let dx = -2; dx <= 2 && okB; dx++) {
+        if (gridB[wrapIdx(texB[0] + dx, texB[1] + dy)] !== 1) okB = false;
+      }
+    }
+    okB = okB && gridB[wrapIdx(texA[0], texA[1])] === 1;
+    record('stage4: paint follows new zoom/pan, earlier paint intact', okB, `texelB=(${texB[0]},${texB[1]})`);
+
+    // brush across the torus seam
+    await page.click('#btn-paint');
+    await page.evaluate(() => {
+      window.__life.clear();
+      window.__life.stampBrush(window.__life.size - 1, 10, 2);
+    });
+    const seam = await gpuGrid(page);
+    let seamOk = true;
+    for (let dy = -2; dy <= 2 && seamOk; dy++) {
+      for (let dx = -2; dx <= 2 && seamOk; dx++) {
+        if (seam[wrapIdx(SIZE - 1 + dx, 10 + dy)] !== 1) seamOk = false;
+      }
+    }
+    seamOk = seamOk && seam[10 * SIZE + SIZE - 4] === 0 && seam[10 * SIZE + 3] === 0;
+    record('stage4: brush wraps across torus seam', seamOk);
+
+    // brush across both seams at a corner
+    await page.evaluate(() => {
+      const s = window.__life.size;
+      window.__life.clear();
+      window.__life.stampBrush(s - 2, s - 2, 2);
+    });
+    const corner = await gpuGrid(page);
+    let cornerOk = true;
+    for (let dy = -2; dy <= 2 && cornerOk; dy++) {
+      for (let dx = -2; dx <= 2 && cornerOk; dx++) {
+        if (corner[wrapIdx(SIZE - 2 + dx, SIZE - 2 + dy)] !== 1) cornerOk = false;
+      }
+    }
+    cornerOk = cornerOk
+      && corner[wrapIdx(0, 0)] === 1
+      && corner[wrapIdx(SIZE - 1, 0)] === 1
+      && corner[wrapIdx(0, SIZE - 1)] === 1
+      && corner[wrapIdx(1, 1)] === 0
+      && corner[wrapIdx(2, SIZE - 2)] === 0;
+    record('stage4: brush wraps across both seams (corner)', cornerOk,
+      `alive=${corner.reduce((a, b) => a + b, 0)}/25`);
+
+    // glider pattern stamped exactly
+    const GLIDER_CELLS = [[0, 0], [1, 0], [2, 0], [0, 1], [1, 2]];
+    await page.evaluate(() => {
+      window.__life.clear();
+      window.__life.stampPattern('glider', 7, 9);
+    });
+    const gliderGrid = await gpuGrid(page);
+    const gliderWant = new Uint8Array(SIZE * SIZE);
+    for (const [x, y] of GLIDER_CELLS) gliderWant[(9 + y) * SIZE + (7 + x)] = 1;
+    record('stage4: glider pattern stamped exactly', countDiff(gliderGrid, gliderWant) === 0);
+
+    // blinker stamps and evolves one generation exactly
+    await page.evaluate(() => {
+      window.__life.clear();
+      window.__life.stampPattern('blinker', 20, 30);
+    });
+    const blinkBefore = await gpuGrid(page);
+    const blinkRef = cpuStep(blinkBefore, SIZE);
+    await page.evaluate(() => window.__life.step(1));
+    const blinkAfter = await gpuGrid(page);
+    record('stage4: blinker stamps and evolves correctly', countDiff(blinkRef, blinkAfter) === 0);
+
+    // Gosper gun: fingerprint, CPU-exact evolution, population growth (emission)
+    const GUN_CELLS = [
+      [24, 0], [22, 1], [24, 1],
+      [12, 2], [13, 2], [20, 2], [21, 2], [34, 2], [35, 2],
+      [11, 3], [15, 3], [20, 3], [21, 3], [34, 3], [35, 3],
+      [0, 4], [1, 4], [10, 4], [16, 4], [20, 4], [21, 4],
+      [0, 5], [1, 5], [10, 5], [14, 5], [16, 5], [17, 5], [22, 5], [24, 5],
+      [10, 6], [16, 6], [24, 6], [11, 7], [15, 7], [12, 8], [13, 8],
+    ];
+    await page.evaluate(() => {
+      window.__life.clear();
+      window.__life.stampPattern('gun', 4, 4);
+    });
+    const gunStamped = await gpuGrid(page);
+    const rowWant = [1, 2, 6, 6, 6, 8, 3, 2, 2];
+    let rowsOk = true;
+    for (let r = 0; r < 9; r++) {
+      let c = 0;
+      for (let x = 0; x < 36; x++) c += gunStamped[(4 + r) * SIZE + (4 + x)];
+      if (c !== rowWant[r]) rowsOk = false;
+    }
+    record('stage4: Gosper gun fingerprint (36 cells, canonical rows)', rowsOk);
+
+    let refGun = new Uint8Array(SIZE * SIZE);
+    for (const [x, y] of GUN_CELLS) refGun[(4 + y) * SIZE + (4 + x)] = 1;
+    let gunExact = true;
+    for (let g = 1; g <= 60; g++) {
+      refGun = cpuStep(refGun, SIZE);
+      await page.evaluate(() => window.__life.step(1));
+      if (g === 10 || g === 30 || g === 60) {
+        const got = await gpuGrid(page);
+        if (countDiff(refGun, got) !== 0) gunExact = false;
+      }
+    }
+    const gunFinal = await gpuGrid(page);
+    let pop60 = 0;
+    for (let i = 0; i < gunFinal.length; i++) pop60 += gunFinal[i];
+    record('stage4: gun matches CPU for 60 generations', gunExact);
+    record('stage4: gun emits gliders (population grows)', pop60 > 41, `pop@60=${pop60}`);
+
+    // pattern stamped via toolbar (DOM)
+    await page.click('#btn-clear');
+    await page.selectOption('#pattern', 'glider');
+    await page.click('#btn-paint');
+    const posP = [400, 260];
+    const texP = await expectedTexel(posP[0], posP[1]);
+    await page.mouse.move(posP[0], posP[1]);
+    await page.mouse.down();
+    await page.mouse.up();
+    const domPattern = await gpuGrid(page);
+    const domWant = new Uint8Array(SIZE * SIZE);
+    for (const [x, y] of GLIDER_CELLS) domWant[wrapIdx(texP[0] + x, texP[1] + y)] = 1;
+    record('stage4: pattern stamp via toolbar (DOM)', countDiff(domPattern, domWant) === 0, `texel=(${texP[0]},${texP[1]})`);
+    await page.selectOption('#pattern', 'brush');
+    await page.click('#btn-paint');
+
+    // grid switch to 2048: reallocated once, rule still exact
+    await page.selectOption('#grid-size', '2048');
+    await page.waitForTimeout(100);
+    const s2048 = await page.evaluate(() => window.__life.size);
+    const noErr2048 = await page.evaluate(() => !document.getElementById('error'));
+    await page.evaluate(() => {
+      window.__life.clear();
+      window.__life.stampPattern('blinker', 100, 100);
+    });
+    const b2048 = await gpuGrid(page);
+    const ref2048 = cpuStep(b2048, 2048);
+    await page.evaluate(() => window.__life.step(1));
+    const a2048 = await gpuGrid(page);
+    const up2048 = await uploads();
+    record('stage4: grid switch to 2048 keeps rule correct',
+      s2048 === 2048 && noErr2048 && countDiff(ref2048, a2048) === 0
+      && up2048.texImage2D === 2 && up2048.deleteTexture === 2,
+      `texImage2D=${up2048.texImage2D} deleteTexture=${up2048.deleteTexture}`);
+
+    // grid switch to 4096: works, blinker flips correctly
+    await page.selectOption('#grid-size', '4096');
+    const s4096 = await page.evaluate(() => window.__life.size);
+    await page.evaluate(() => {
+      window.__life.clear();
+      window.__life.stampPattern('blinker', 500, 500);
+    });
+    const g4096a = await gen();
+    await page.evaluate(() => window.__life.step(1));
+    const g4096b = await gen();
+    const regRaw = await page.evaluate(() => Array.from(window.__life.read(499, 499, 3, 3)));
+    const reg = [];
+    for (let i = 0; i < 9; i++) reg.push(regRaw[i * 4] > 127 ? 1 : 0);
+    const regWant = [0, 0, 1, 0, 0, 1, 0, 0, 1];
+    const up4096 = await uploads();
+    record('stage4: grid switch to 4096 works, rule correct',
+      s4096 === 4096 && g4096b === g4096a + 1 && reg.every((v, i) => v === regWant[i])
+      && up4096.texImage2D === 4 && up4096.deleteTexture === 4,
+      `size=${s4096} gens=${g4096a}->${g4096b} texImage2D=${up4096.texImage2D} `
+      + `deleteTexture=${up4096.deleteTexture} reg=${JSON.stringify(reg)}`);
+
+    // grid options sanity
+    const opts = await page.evaluate(() => Array.from(document.getElementById('grid-size').options).map((o) => Number(o.value)));
+    record('stage4: grid options are powers of two <= 4096',
+      opts.every((v) => v > 0 && (v & (v - 1)) === 0 && v <= 4096), JSON.stringify(opts));
+  }
+
   // ---- Loop hygiene with auto stepping on (second page) ----
   {
     const page2 = await browser.newPage({ viewport: { width: 800, height: 600 } });
@@ -400,6 +669,12 @@ async function main() {
     record('loop: no extra allocations while running', c.textures === 2 && c.framebuffers === 2, JSON.stringify(c));
     await page2.close();
   }
+
+  record(
+    'no page errors or console errors across the whole run',
+    pageErrors.length === 0 && !console_.some((m) => m.startsWith('[error]')),
+    [...pageErrors, ...console_.filter((m) => m.startsWith('[error]'))].join('; ') || undefined,
+  );
 
   await browser.close();
   server.close();

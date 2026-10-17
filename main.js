@@ -91,6 +91,31 @@ function createSimTargets(size) {
   return { textures: textures, fbos: fbos };
 }
 
+function makePattern(w, h, coords) {
+  const bits = new Uint8Array(w * h);
+  for (let i = 0; i < coords.length; i++) {
+    bits[coords[i][1] * w + coords[i][0]] = 1;
+  }
+  return { w: w, h: h, bits: bits };
+}
+
+const PATTERNS = {
+  glider: makePattern(3, 3, [[0, 0], [1, 0], [2, 0], [0, 1], [1, 2]]),
+  blinker: makePattern(3, 1, [[0, 0], [1, 0], [2, 0]]),
+  gun: makePattern(36, 9, [
+    [24, 0],
+    [22, 1], [24, 1],
+    [12, 2], [13, 2], [20, 2], [21, 2], [34, 2], [35, 2],
+    [11, 3], [15, 3], [20, 3], [21, 3], [34, 3], [35, 3],
+    [0, 4], [1, 4], [10, 4], [16, 4], [20, 4], [21, 4],
+    [0, 5], [1, 5], [10, 5], [14, 5], [16, 5], [17, 5], [22, 5], [24, 5],
+    [10, 6], [16, 6], [24, 6],
+    [11, 7], [15, 7],
+    [12, 8], [13, 8],
+  ]),
+};
+
+const MAX_BRUSH_SIDE = 65;
 const MAX_STEPS_PER_FRAME = 8;
 
 async function main() {
@@ -115,12 +140,13 @@ async function main() {
     uGrid: gl.getUniformLocation(displayProgram, 'uGrid'),
   };
 
-  const size = gridSize();
-  const targets = createSimTargets(size);
-  const textures = targets.textures;
-  const fbos = targets.fbos;
+  let size = gridSize();
+  let targets = createSimTargets(size);
+  let textures = targets.textures;
+  let fbos = targets.fbos;
   let read = 0;
   let write = 1;
+  let generation = 0;
 
   let camX = 0;
   let camY = 0;
@@ -129,6 +155,17 @@ async function main() {
   let isDragging = 0;
   let dragLastX = 0;
   let dragLastY = 0;
+  let hoverX = 0;
+  let hoverY = 0;
+
+  let paintMode = 0;
+  let painting = 0;
+  let brushRadius = 2;
+  let selectedPattern = 'brush';
+
+  const patchBuf = new Uint8Array(MAX_BRUSH_SIDE * MAX_BRUSH_SIDE * 4);
+  const packBuf = new Uint8Array(MAX_BRUSH_SIDE * MAX_BRUSH_SIDE * 4);
+  let fullBuf = new Uint8Array(size * size * 4);
 
   function cellsY() {
     return cellsX * gl.drawingBufferHeight / gl.drawingBufferWidth;
@@ -152,7 +189,7 @@ async function main() {
   }
 
   const spsParam = Number(new URLSearchParams(location.search).get('sps'));
-  const stepsPerSecond = Number.isFinite(spsParam) && spsParam > 0 ? spsParam : 10;
+  let stepsPerSecond = Number.isFinite(spsParam) && spsParam > 0 ? spsParam : 10;
   let auto = true;
   let lastTime = -1;
   let accumulator = 0;
@@ -169,6 +206,7 @@ async function main() {
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     read = write;
     write ^= 1;
+    generation++;
   }
 
   function display() {
@@ -183,6 +221,111 @@ async function main() {
     gl.uniform2f(displayLoc.uCells, cellsX, cellsY());
     gl.uniform1f(displayLoc.uGrid, size);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+
+  function uploadSeg(dstX, dstY, ow, oh, srcX0, srcY0, w, h, src) {
+    for (let row = 0; row < oh; row++) {
+      let po = row * ow * 4;
+      let so = ((srcY0 + row) * w + srcX0) * 4;
+      for (let col = 0; col < ow; col++) {
+        packBuf[po] = src[so];
+        packBuf[po + 1] = src[so + 1];
+        packBuf[po + 2] = src[so + 2];
+        packBuf[po + 3] = src[so + 3];
+        po += 4;
+        so += 4;
+      }
+    }
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, dstX, dstY, ow, oh, gl.RGBA, gl.UNSIGNED_BYTE, packBuf);
+  }
+
+  // Torus-wrapped patch upload into the live state texture (read target).
+  // Full-grid patches go direct; smaller ones may split into up to 4 uploads.
+  function uploadPatch(x0, y0, w, h, src) {
+    gl.bindTexture(gl.TEXTURE_2D, textures[read]);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    if (x0 === 0 && y0 === 0 && w === size && h === size) {
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, size, size, gl.RGBA, gl.UNSIGNED_BYTE, src);
+      return;
+    }
+    const sx = ((x0 % size) + size) % size;
+    const sy = ((y0 % size) + size) % size;
+    const xEnd = sx + w;
+    const yEnd = sy + h;
+    const w1 = Math.min(size, xEnd) - sx;
+    const h1 = Math.min(size, yEnd) - sy;
+    if (w1 > 0 && h1 > 0) uploadSeg(sx, sy, w1, h1, 0, 0, w, h, src);
+    if (xEnd > size && h1 > 0) uploadSeg(0, sy, xEnd - size, h1, w1, 0, w, h, src);
+    if (yEnd > size && w1 > 0) uploadSeg(sx, 0, w1, yEnd - size, 0, h1, w, h, src);
+    if (xEnd > size && yEnd > size) uploadSeg(0, 0, xEnd - size, yEnd - size, w1, h1, w, h, src);
+  }
+
+  function stampBrush(cx, cy, r) {
+    const side = 2 * r + 1;
+    const n = side * side;
+    for (let i = 0; i < n; i++) {
+      patchBuf[i * 4] = 255;
+      patchBuf[i * 4 + 1] = 255;
+      patchBuf[i * 4 + 2] = 255;
+      patchBuf[i * 4 + 3] = 255;
+    }
+    uploadPatch(cx - r, cy - r, side, side, patchBuf);
+  }
+
+  function stampPattern(name, x0, y0) {
+    const p = PATTERNS[name];
+    if (!p) return;
+    const n = p.w * p.h;
+    for (let i = 0; i < n; i++) {
+      const alive = p.bits[i] ? 255 : 0;
+      patchBuf[i * 4] = alive;
+      patchBuf[i * 4 + 1] = alive;
+      patchBuf[i * 4 + 2] = alive;
+      patchBuf[i * 4 + 3] = 255;
+    }
+    uploadPatch(x0, y0, p.w, p.h, patchBuf);
+  }
+
+  function clearGrid() {
+    fullBuf.fill(0);
+    uploadPatch(0, 0, size, size, fullBuf);
+  }
+
+  function randomize() {
+    const n = size * size;
+    for (let i = 0; i < n; i++) {
+      const v = Math.random() < 0.5 ? 0 : 255;
+      fullBuf[i * 4] = v;
+      fullBuf[i * 4 + 1] = v;
+      fullBuf[i * 4 + 2] = v;
+      fullBuf[i * 4 + 3] = 255;
+    }
+    uploadPatch(0, 0, size, size, fullBuf);
+  }
+
+  function applyGridSize(newSize) {
+    if (newSize === size) return;
+    for (let i = 0; i < 2; i++) {
+      gl.deleteFramebuffer(fbos[i]);
+      gl.deleteTexture(textures[i]);
+    }
+    size = newSize;
+    targets = createSimTargets(size);
+    textures = targets.textures;
+    fbos = targets.fbos;
+    read = 0;
+    write = 1;
+    generation = 0;
+    fullBuf = new Uint8Array(size * size * 4);
+    window.__life.size = size;
+    fitView();
+  }
+
+  function updateHover(e) {
+    const ux = e.offsetX / canvas.clientWidth;
+    const uy = 1 - e.offsetY / canvas.clientHeight;
+    hoverX = Math.floor(camX + ux * cellsX);
+    hoverY = Math.floor(camY + uy * cellsY());
   }
 
   function onWheel(e) {
@@ -204,17 +347,36 @@ async function main() {
   }
 
   function onMouseDown(e) {
-    isDragging = 1;
-    dragLastX = e.offsetX;
-    dragLastY = e.offsetY;
-    userInteracted = 1;
+    updateHover(e);
+    if (paintMode) {
+      if (selectedPattern === 'brush') {
+        painting = 1;
+        stampBrush(hoverX, hoverY, brushRadius);
+      } else {
+        stampPattern(selectedPattern, hoverX, hoverY);
+      }
+    } else {
+      isDragging = 1;
+      dragLastX = e.offsetX;
+      dragLastY = e.offsetY;
+      userInteracted = 1;
+    }
   }
 
   function onMouseUp() {
     isDragging = 0;
+    painting = 0;
   }
 
   function onMouseMove(e) {
+    if (e.target !== canvas) return;
+    if (paintMode) {
+      if (painting) {
+        updateHover(e);
+        stampBrush(hoverX, hoverY, brushRadius);
+      }
+      return;
+    }
     if (!isDragging) return;
     camX -= ((e.offsetX - dragLastX) / canvas.clientWidth) * cellsX;
     camY += ((e.offsetY - dragLastY) / canvas.clientHeight) * cellsY();
@@ -222,12 +384,52 @@ async function main() {
     dragLastY = e.offsetY;
   }
 
+  const btnPlay = document.getElementById('btn-play');
+  const btnStep = document.getElementById('btn-step');
+  const elSpeed = document.getElementById('speed');
+  const elGrid = document.getElementById('grid-size');
+  const btnClear = document.getElementById('btn-clear');
+  const btnRandom = document.getElementById('btn-random');
+  const btnPaint = document.getElementById('btn-paint');
+  const elBrush = document.getElementById('brush-size');
+  const elPattern = document.getElementById('pattern');
+
+  function updatePlayLabel() {
+    btnPlay.textContent = auto ? 'Pause' : 'Play';
+  }
+
+  function updatePaintLabel() {
+    btnPaint.textContent = paintMode ? 'Paint: on' : 'Paint: off';
+  }
+
+  function setAuto(value) {
+    auto = !!value;
+    accumulator = 0;
+    updatePlayLabel();
+  }
+
+  btnPlay.addEventListener('click', function () { setAuto(!auto); });
+  btnStep.addEventListener('click', function () { stepOnce(); });
+  elSpeed.addEventListener('input', function () { stepsPerSecond = elSpeed.valueAsNumber; });
+  elGrid.addEventListener('change', function () { applyGridSize(Number(elGrid.value)); });
+  btnClear.addEventListener('click', clearGrid);
+  btnRandom.addEventListener('click', randomize);
+  btnPaint.addEventListener('click', function () {
+    paintMode ^= 1;
+    painting = 0;
+    updatePaintLabel();
+  });
+  elBrush.addEventListener('input', function () { brushRadius = Math.floor(elBrush.valueAsNumber / 2); });
+  elPattern.addEventListener('change', function () { selectedPattern = elPattern.value; });
+
+  const maxAllowed = Math.min(4096, gl.getParameter(gl.MAX_TEXTURE_SIZE));
+  for (let i = 0; i < elGrid.options.length; i++) {
+    if (Number(elGrid.options[i].value) > maxAllowed) elGrid.options[i].hidden = true;
+  }
+
   window.__life = {
     size: size,
-    setAuto: function (value) {
-      auto = !!value;
-      accumulator = 0;
-    },
+    setAuto: setAuto,
     step: function (n) {
       for (let i = 0; i < n; i++) stepOnce();
     },
@@ -253,6 +455,13 @@ async function main() {
       gl.readPixels(x, y, w, h, gl.RGBA, gl.UNSIGNED_BYTE, buf);
       return buf;
     },
+    generation: function () {
+      return generation;
+    },
+    stampBrush: stampBrush,
+    stampPattern: stampPattern,
+    clear: clearGrid,
+    randomize: randomize,
   };
 
   window.addEventListener('resize', resize);
@@ -261,6 +470,8 @@ async function main() {
   window.addEventListener('mouseup', onMouseUp);
   window.addEventListener('mousemove', onMouseMove);
 
+  updatePlayLabel();
+  updatePaintLabel();
   fitView();
   resize();
 
@@ -270,15 +481,19 @@ async function main() {
     lastTime = now;
     if (dt > 0) {
       if (dt > 0.25) dt = 0.25;
-      accumulator += dt;
-      const stepDuration = 1 / stepsPerSecond;
-      let steps = 0;
-      while (accumulator >= stepDuration && steps < MAX_STEPS_PER_FRAME) {
-        stepOnce();
-        accumulator -= stepDuration;
-        steps++;
-      }
-      if (steps === MAX_STEPS_PER_FRAME && accumulator > stepDuration) {
+      if (auto) {
+        accumulator += dt;
+        const stepDuration = 1 / stepsPerSecond;
+        let steps = 0;
+        while (accumulator >= stepDuration && steps < MAX_STEPS_PER_FRAME) {
+          stepOnce();
+          accumulator -= stepDuration;
+          steps++;
+        }
+        if (steps === MAX_STEPS_PER_FRAME && accumulator > stepDuration) {
+          accumulator = 0;
+        }
+      } else {
         accumulator = 0;
       }
     }
