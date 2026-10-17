@@ -99,6 +99,16 @@ function makePattern(w, h, coords) {
   return { w: w, h: h, bits: bits };
 }
 
+function mulberry32(a) {
+  return function () {
+    a |= 0;
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
 const PATTERNS = {
   glider: makePattern(3, 3, [[0, 0], [1, 0], [2, 0], [0, 1], [1, 2]]),
   blinker: makePattern(3, 1, [[0, 0], [1, 0], [2, 0]]),
@@ -303,6 +313,27 @@ async function main() {
     uploadPatch(0, 0, size, size, fullBuf);
   }
 
+  const DEMO_SEED = 0x2F6E2B1;
+
+  function seededFill(seed) {
+    const rnd = mulberry32(seed >>> 0);
+    const n = size * size;
+    for (let i = 0; i < n; i++) {
+      const v = rnd() < 0.5 ? 0 : 255;
+      fullBuf[i * 4] = v;
+      fullBuf[i * 4 + 1] = v;
+      fullBuf[i * 4 + 2] = v;
+      fullBuf[i * 4 + 3] = 255;
+    }
+    uploadPatch(0, 0, size, size, fullBuf);
+  }
+
+  function initSeed() {
+    const param = new URLSearchParams(location.search).get('seed');
+    if (param === null) return;
+    seededFill(param === 'demo' ? DEMO_SEED : Number(param) >>> 0);
+  }
+
   function applyGridSize(newSize) {
     if (newSize === size) return;
     for (let i = 0; i < 2; i++) {
@@ -422,13 +453,20 @@ async function main() {
   elBrush.addEventListener('input', function () { brushRadius = Math.floor(elBrush.valueAsNumber / 2); });
   elPattern.addEventListener('change', function () { selectedPattern = elPattern.value; });
 
-  const maxAllowed = Math.min(4096, gl.getParameter(gl.MAX_TEXTURE_SIZE));
+  const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+  const maxAllowed = Math.min(4096, maxTextureSize);
   for (let i = 0; i < elGrid.options.length; i++) {
     if (Number(elGrid.options[i].value) > maxAllowed) elGrid.options[i].hidden = true;
   }
 
+  const elHud = document.getElementById('hud');
+  let hudFrames = 0;
+  let hudLastGen = 0;
+  let hudLastTime = -1;
+
   window.__life = {
     size: size,
+    maxTextureSize: maxTextureSize,
     setAuto: setAuto,
     step: function (n) {
       for (let i = 0; i < n; i++) stepOnce();
@@ -474,6 +512,7 @@ async function main() {
   updatePaintLabel();
   fitView();
   resize();
+  initSeed();
 
   function frame(now) {
     if (lastTime < 0) lastTime = now;
@@ -496,6 +535,17 @@ async function main() {
       } else {
         accumulator = 0;
       }
+    }
+    hudFrames++;
+    if (hudLastTime < 0) hudLastTime = now;
+    if (now - hudLastTime >= 1000) {
+      const hudDt = (now - hudLastTime) / 1000;
+      const fps = Math.round(hudFrames / hudDt);
+      const genRate = Math.round((generation - hudLastGen) / hudDt);
+      elHud.textContent = fps + ' fps | ' + genRate + ' gen/s | gen ' + generation;
+      hudFrames = 0;
+      hudLastGen = generation;
+      hudLastTime = now;
     }
     display();
     requestAnimationFrame(frame);

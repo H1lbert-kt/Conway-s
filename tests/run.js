@@ -646,6 +646,165 @@ async function main() {
       opts.every((v) => v > 0 && (v & (v - 1)) === 0 && v <= 4096), JSON.stringify(opts));
   }
 
+  // ---- Stage 5: validation goldens, HUD, seed, perf ----
+  {
+    // Gosper gun golden checkpoints (canonical populations + emitted-glider offsets).
+    // Offsets derived from the B3/S23 CPU reference with the canonical gun at (10,10)
+    // on a 128^2 grid: gun activity stays inside x 10..45, y 10..18; gliders leave it.
+    const GUN_OX = 10;
+    const GUN_OY = 10;
+    const GUN_OUT30 = [[33, 19], [34, 20], [35, 20], [33, 21], [34, 21]];
+    const GUN_OUT60 = [[33, 19], [34, 20], [35, 20], [33, 21], [34, 21], [40, 27], [42, 27], [41, 28], [42, 28], [41, 29]];
+    const popOf = (grid) => { let p = 0; for (let i = 0; i < grid.length; i++) p += grid[i]; return p; };
+    const outsideCells = (grid, n) => {
+      const cells = [];
+      for (let y = 0; y < n; y++) {
+        for (let x = 0; x < n; x++) {
+          if (!grid[y * n + x]) continue;
+          if (x >= GUN_OX && x <= GUN_OX + 35 && y >= GUN_OY && y <= GUN_OY + 8) continue;
+          cells.push([x, y]);
+        }
+      }
+      return cells;
+    };
+
+    const gunPage = await browser.newPage({ viewport: { width: 400, height: 300 } });
+    const gunErrs = [];
+    gunPage.on('pageerror', (e) => gunErrs.push(String(e)));
+    await gunPage.goto(`${base}?size=128&sps=0.0001`, { timeout: 60000 });
+    await gunPage.waitForFunction(() => !!window.__life);
+    await gunPage.evaluate(() => {
+      window.__life.setAuto(false);
+      window.__life.clear();
+      window.__life.stampPattern('gun', 10, 10);
+    });
+    const gun0 = await gpuGrid(gunPage);
+    const out0 = outsideCells(gun0, 128);
+    await gunPage.evaluate(() => window.__life.step(30));
+    const gun30 = await gpuGrid(gunPage);
+    const out30 = outsideCells(gun30, 128);
+    await gunPage.evaluate(() => window.__life.step(30));
+    const gun60 = await gpuGrid(gunPage);
+    const out60 = outsideCells(gun60, 128);
+    const gunErrFree = gunErrs.length === 0 && (await gunPage.evaluate(() => !document.getElementById('error')));
+    await gunPage.close();
+    record('stage5: gun golden populations (36/41/46 at gen 0/30/60)',
+      popOf(gun0) === 36 && popOf(gun30) === 41 && popOf(gun60) === 46 && gunErrFree,
+      `pops=${popOf(gun0)}/${popOf(gun30)}/${popOf(gun60)}`);
+    record('stage5: gun golden emitted-glider offsets',
+      JSON.stringify(out0) === '[]'
+      && JSON.stringify(out30) === JSON.stringify(GUN_OUT30)
+      && JSON.stringify(out60) === JSON.stringify(GUN_OUT60),
+      `out30=${JSON.stringify(out30)} out60=${JSON.stringify(out60)}`);
+
+    // HUD: present, correct format, ~1 Hz cadence (measured display-only so frames
+    // are fast enough for a bounded window), then gen advances while auto is on.
+    const gen = () => page.evaluate(() => window.__life.generation());
+    const hudExists = await page.evaluate(() => !!document.getElementById('hud'));
+    const hudCadence = await page.evaluate(() => new Promise((resolve) => {
+      const hud = document.getElementById('hud');
+      let changes = 0;
+      const obs = new MutationObserver(() => { changes++; });
+      obs.observe(hud, { childList: true, characterData: true, subtree: true });
+      setTimeout(() => {
+        obs.disconnect();
+        resolve({ changes, text: hud.textContent });
+      }, 1200);
+    }));
+    const hudMatch = /^(\d+) fps \| (\d+) gen\/s \| gen (\d+)/.exec(hudCadence.text);
+    record('stage5: HUD present, ~1 Hz cadence, format fps|gen/s|gen',
+      hudExists && !!hudMatch && hudCadence.changes >= 1 && hudCadence.changes <= 3,
+      `changes=${hudCadence.changes} text="${hudCadence.text}"`);
+
+    const genBeforeHud = await gen();
+    await page.click('#btn-play');
+    await page.waitForTimeout(3500);
+    const genAfterHud = await gen();
+    await page.click('#btn-play');
+    const hudPlaying = await page.textContent('#hud');
+    const hudGen = /gen (\d+)/.exec(hudPlaying);
+    record('stage5: HUD tracks simulation while running',
+      genAfterHud > genBeforeHud && !!hudGen && Number(hudGen[1]) > 0,
+      `gen ${genBeforeHud} -> ${genAfterHud}, hud="${hudPlaying}"`);
+
+    // ?seed= determinism: same seed twice identical, different seeds differ, default empty
+    const loadSeed = async (query) => {
+      const p = await browser.newPage({ viewport: { width: 220, height: 160 } });
+      await p.addInitScript(() => {
+        window.__up = { texSubImage2D: 0 };
+        const orig = WebGL2RenderingContext.prototype.texSubImage2D;
+        WebGL2RenderingContext.prototype.texSubImage2D = function () { window.__up.texSubImage2D++; return orig.apply(this, arguments); };
+      });
+      await p.goto(`${base}?size=64&sps=0.0001${query ? '&' + query : ''}`, { timeout: 60000 });
+      await p.waitForFunction(() => !!window.__life);
+      const grid = await gpuGrid(p);
+      const ups = await p.evaluate(() => window.__up.texSubImage2D);
+      await p.close();
+      return { grid, ups };
+    };
+    const seedA = await loadSeed('seed=demo');
+    const seedB = await loadSeed('seed=demo');
+    const seedC = await loadSeed('seed=1');
+    const seedDefault = await loadSeed('');
+    const gridsEq = (x, y) => countDiff(x, y) === 0;
+    const aliveA = seedA.grid.reduce((a, b) => a + b, 0);
+    record('stage5: ?seed=demo deterministic across loads (single upload)',
+      gridsEq(seedA.grid, seedB.grid) && seedA.ups === 1 && seedB.ups === 1 && aliveA > 0,
+      `alive=${aliveA} uploads=${seedA.ups}/${seedB.ups}`);
+    record('stage5: different seeds differ; default load stays empty',
+      !gridsEq(seedA.grid, seedC.grid) && gridsEq(seedDefault.grid, new Uint8Array(SIZE * SIZE))
+      && seedC.ups === 1 && seedDefault.ups === 0,
+      `seed1ups=${seedC.ups} defaultups=${seedDefault.ups}`);
+
+    // MAX_TEXTURE_SIZE exposed; selector caps at min(4096, MAX_TEXTURE_SIZE)
+    const capInfo = await page.evaluate(() => ({
+      visible: Array.from(document.getElementById('grid-size').options)
+        .filter((o) => !o.hidden).map((o) => Number(o.value)),
+      max: window.__life.maxTextureSize,
+    }));
+    record('stage5: selector caps at min(4096, MAX_TEXTURE_SIZE)',
+      capInfo.max >= 1024 && capInfo.visible.length > 0
+      && capInfo.visible.every((v) => v <= Math.min(4096, capInfo.max)),
+      `max=${capInfo.max} visible=${JSON.stringify(capInfo.visible)}`);
+
+    // 4096^2 with the sim running every frame: profiled for the README (software
+    // GL makes the O(size^2) sim shader the bottleneck — see issue #5 plan adjustment).
+    const measureSimFps = async (gridSize) => {
+      const p = await browser.newPage({ viewport: { width: 512, height: 512 } });
+      await p.addInitScript(() => {
+        window.__counters = { drawArrays: 0 };
+        const origDraw = WebGL2RenderingContext.prototype.drawArrays;
+        WebGL2RenderingContext.prototype.drawArrays = function () { window.__counters.drawArrays++; return origDraw.apply(this, arguments); };
+      });
+      await p.goto(`${base}?size=${gridSize}&sps=120`, { timeout: 60000 });
+      await p.waitForFunction(() => !!window.__life);
+      await p.waitForTimeout(500);
+      const d0 = await p.evaluate(() => window.__counters.drawArrays);
+      const g0 = await p.evaluate(() => window.__life.generation());
+      await p.waitForTimeout(2000);
+      let elapsed = 2;
+      let d1 = await p.evaluate(() => window.__counters.drawArrays);
+      let g1 = await p.evaluate(() => window.__life.generation());
+      // Under heavy system load a single 4096^2 software-GL frame can outlast the
+      // base window; poll in 1 s slices until a generation completes (bounded at +8 s).
+      for (let extra = 0; extra < 8 && g1 === g0; extra++) {
+        await p.waitForTimeout(1000);
+        elapsed += 1;
+        d1 = await p.evaluate(() => window.__counters.drawArrays);
+        g1 = await p.evaluate(() => window.__life.generation());
+      }
+      const err = await p.evaluate(() => !!document.getElementById('error'));
+      await p.close();
+      return { fps: (d1 - d0) / elapsed, genDelta: g1 - g0, err };
+    };
+    const sim64 = await measureSimFps(64);
+    const sim4k = await measureSimFps(4096);
+    record('stage5: 4096^2 sim+display runs and advances generations (profiled)',
+      !sim4k.err && !sim64.err && sim4k.genDelta > 0 && sim64.genDelta > 0,
+      `sim+display fps@64=${sim64.fps.toFixed(1)} (gen+${sim64.genDelta}), `
+      + `fps@4096=${sim4k.fps.toFixed(1)} (gen+${sim4k.genDelta})`);
+  }
+
   // ---- Loop hygiene with auto stepping on (second page) ----
   {
     const page2 = await browser.newPage({ viewport: { width: 800, height: 600 } });

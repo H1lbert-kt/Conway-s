@@ -24,6 +24,15 @@
     }
     #toolbar button { cursor: pointer; }
     #toolbar label { display: flex; gap: 4px; align-items: center; }
+    #hud {
+      position: fixed; bottom: 0; left: 0; z-index: 1;
+      padding: 4px 8px;
+      background: rgba(11, 11, 16, 0.88);
+      color: #e8ecff;
+      font: 12px/1.2 monospace;
+      border-top-right-radius: 6px;
+      pointer-events: none;
+    }
   </style>
 </head>
 <body>
@@ -48,6 +57,7 @@
       <option value="gun">Gosper gun</option>
     </select></label>
   </div>
+  <div id="hud"></div>
   <script type="module" src="main.js"></script>
 </body>
 </html>
