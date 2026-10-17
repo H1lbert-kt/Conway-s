@@ -80,7 +80,7 @@ function createSimTargets(size) {
     if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
       throw new Error('framebuffer ' + i + ' is incomplete');
     }
-    gl.clearColor(0, 0, 0, 1);
+    gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
 
     textures[i] = texture;
@@ -127,6 +127,9 @@ const PATTERNS = {
 
 const MAX_BRUSH_SIDE = 65;
 const MAX_STEPS_PER_FRAME = 8;
+// Conway masks in the byte layout (stage 6): G = birth mask, B = survival mask.
+const CONWAY_BIRTH_MASK = 0x08; // B3 = born with 3 neighbors
+const CONWAY_SURV_MASK = 0x0c; // S23 = survives with 2 or 3 neighbors
 
 async function main() {
   const sources = await Promise.all([
@@ -274,10 +277,10 @@ async function main() {
     const side = 2 * r + 1;
     const n = side * side;
     for (let i = 0; i < n; i++) {
-      patchBuf[i * 4] = 255;
-      patchBuf[i * 4 + 1] = 255;
-      patchBuf[i * 4 + 2] = 255;
-      patchBuf[i * 4 + 3] = 255;
+      patchBuf[i * 4] = 1;
+      patchBuf[i * 4 + 1] = CONWAY_BIRTH_MASK;
+      patchBuf[i * 4 + 2] = CONWAY_SURV_MASK;
+      patchBuf[i * 4 + 3] = 0;
     }
     uploadPatch(cx - r, cy - r, side, side, patchBuf);
   }
@@ -287,28 +290,32 @@ async function main() {
     if (!p) return;
     const n = p.w * p.h;
     for (let i = 0; i < n; i++) {
-      const alive = p.bits[i] ? 255 : 0;
-      patchBuf[i * 4] = alive;
-      patchBuf[i * 4 + 1] = alive;
-      patchBuf[i * 4 + 2] = alive;
-      patchBuf[i * 4 + 3] = 255;
+      patchBuf[i * 4] = p.bits[i] ? 1 : 0;
+      patchBuf[i * 4 + 1] = CONWAY_BIRTH_MASK;
+      patchBuf[i * 4 + 2] = CONWAY_SURV_MASK;
+      patchBuf[i * 4 + 3] = 0;
     }
     uploadPatch(x0, y0, p.w, p.h, patchBuf);
   }
 
   function clearGrid() {
-    fullBuf.fill(0);
+    const n = size * size;
+    for (let i = 0; i < n; i++) {
+      fullBuf[i * 4] = 0;
+      fullBuf[i * 4 + 1] = CONWAY_BIRTH_MASK;
+      fullBuf[i * 4 + 2] = CONWAY_SURV_MASK;
+      fullBuf[i * 4 + 3] = 0;
+    }
     uploadPatch(0, 0, size, size, fullBuf);
   }
 
   function randomize() {
     const n = size * size;
     for (let i = 0; i < n; i++) {
-      const v = Math.random() < 0.5 ? 0 : 255;
-      fullBuf[i * 4] = v;
-      fullBuf[i * 4 + 1] = v;
-      fullBuf[i * 4 + 2] = v;
-      fullBuf[i * 4 + 3] = 255;
+      fullBuf[i * 4] = Math.random() < 0.5 ? 0 : 1;
+      fullBuf[i * 4 + 1] = CONWAY_BIRTH_MASK;
+      fullBuf[i * 4 + 2] = CONWAY_SURV_MASK;
+      fullBuf[i * 4 + 3] = 0;
     }
     uploadPatch(0, 0, size, size, fullBuf);
   }
@@ -319,11 +326,10 @@ async function main() {
     const rnd = mulberry32(seed >>> 0);
     const n = size * size;
     for (let i = 0; i < n; i++) {
-      const v = rnd() < 0.5 ? 0 : 255;
-      fullBuf[i * 4] = v;
-      fullBuf[i * 4 + 1] = v;
-      fullBuf[i * 4 + 2] = v;
-      fullBuf[i * 4 + 3] = 255;
+      fullBuf[i * 4] = rnd() < 0.5 ? 0 : 1;
+      fullBuf[i * 4 + 1] = CONWAY_BIRTH_MASK;
+      fullBuf[i * 4 + 2] = CONWAY_SURV_MASK;
+      fullBuf[i * 4 + 3] = 0;
     }
     uploadPatch(0, 0, size, size, fullBuf);
   }
@@ -472,11 +478,30 @@ async function main() {
       for (let i = 0; i < n; i++) stepOnce();
     },
     seed: function (w, h, data) {
+      // Test-seed API stays "RGBA bytes with R>127 = alive"; convert in place to
+      // the Conway byte layout (validation path, never inside frame()).
+      const n = w * h;
+      for (let i = 0; i < n; i++) {
+        const alive = data[i * 4] > 127 ? 1 : 0;
+        data[i * 4] = alive;
+        data[i * 4 + 1] = CONWAY_BIRTH_MASK;
+        data[i * 4 + 2] = CONWAY_SURV_MASK;
+        data[i * 4 + 3] = 0;
+      }
       gl.bindTexture(gl.TEXTURE_2D, textures[read]);
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
       gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, data);
     },
     read: function (x, y, w, h) {
+      const buf = new Uint8Array(w * h * 4);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbos[read]);
+      gl.readPixels(x, y, w, h, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      // Harness contract: channel 0 reads back as 0/255 alive (pre-layout format).
+      for (let i = 0; i < w * h; i++) buf[i * 4] = (buf[i * 4] & 1) ? 255 : 0;
+      return buf;
+    },
+    readRaw: function (x, y, w, h) {
       const buf = new Uint8Array(w * h * 4);
       gl.bindFramebuffer(gl.FRAMEBUFFER, fbos[read]);
       gl.readPixels(x, y, w, h, gl.RGBA, gl.UNSIGNED_BYTE, buf);

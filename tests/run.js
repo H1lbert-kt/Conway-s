@@ -805,6 +805,55 @@ async function main() {
       + `fps@4096=${sim4k.fps.toFixed(1)} (gen+${sim4k.genDelta})`);
   }
 
+  // ---- Stage 6: RGBA8 byte layout, age, raw readback ----
+  {
+    const raw1 = (p, x, y) => p.evaluate(
+      (coords) => Array.from(window.__life.readRaw(coords[0], coords[1], 1, 1)), [x, y],
+    );
+    await page.evaluate(() => { window.__life.setAuto(false); window.__life.clear(); });
+    const rawDead = await raw1(page, 5, 5);
+    await page.evaluate(() => window.__life.stampBrush(10, 10, 0));
+    const rawAlive = await raw1(page, 10, 10);
+    record('stage6: RGBA8 byte layout via normalized round-trip (dead=(0,8,12,0), alive=(1,8,12,0))',
+      rawDead.join() === '0,8,12,0' && rawAlive.join() === '1,8,12,0',
+      `dead=[${rawDead}] alive=[${rawAlive}]`);
+
+    // Age: a seeded block (still life) ages 1 per gen, saturating at 127 (R=255).
+    const seedBlock = () => page.evaluate(() => {
+      window.__life.clear();
+      const d = new Uint8Array(64 * 64 * 4);
+      for (const c of [[30, 30], [31, 30], [30, 31], [31, 31]]) {
+        d[(c[1] * 64 + c[0]) * 4] = 255;
+        d[(c[1] * 64 + c[0]) * 4 + 3] = 255;
+      }
+      window.__life.seed(64, 64, d);
+      window.__life.step(1);
+    });
+    await seedBlock();
+    const age1 = await raw1(page, 30, 30);
+    await page.evaluate(() => window.__life.step(129));
+    const ageSat = await raw1(page, 30, 30);
+    const blockAlive = await page.evaluate(() => window.__life.read(30, 30, 1, 1)[0] === 255);
+    record('stage6: age increments (R=3) then saturates at 127 (R=255); still life stable',
+      age1.join() === '3,8,12,0' && ageSat.join() === '255,8,12,0' && blockAlive,
+      `age1=[${age1}] age130=[${ageSat}]`);
+
+    // Death resets age to 0 but keeps the stored Conway masks.
+    await page.evaluate(() => {
+      window.__life.clear();
+      const d = new Uint8Array(64 * 64 * 4);
+      for (const c of [[29, 30], [30, 30], [31, 30]]) {
+        d[(c[1] * 64 + c[0]) * 4] = 255;
+        d[(c[1] * 64 + c[0]) * 4 + 3] = 255;
+      }
+      window.__life.seed(64, 64, d);
+      window.__life.step(1);
+    });
+    const diedCell = await raw1(page, 29, 30);
+    record('stage6: death resets age to 0 and keeps Conway masks',
+      diedCell.join() === '0,8,12,0', `died=[${diedCell}]`);
+  }
+
   // ---- Loop hygiene with auto stepping on (second page) ----
   {
     const page2 = await browser.newPage({ viewport: { width: 800, height: 600 } });

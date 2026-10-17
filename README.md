@@ -48,7 +48,7 @@ npm install   # só playwright-core, dev-dependency do harness
 npm test
 ```
 
-O harness (`tests/run.js`, Playwright + Chromium headless) roda **49 verificações** e imprime PASS/FAIL por critério, com exit code ≠ 0 em falha. Ele valida:
+O harness (`tests/run.js`, Playwright + Chromium headless) roda **52 verificações** (os 49 testes originais, intocados, + 3 da Stage 6) e imprime PASS/FAIL por critério, com exit code ≠ 0 em falha. Ele valida:
 
 - **Fidelidade bit-a-bit contra uma referência CPU da B3/S23**: blinker, block, glider (interior e **atravessando a costura do toro**), e Gosper gun por 60 gerações.
 - **Golden do Gosper gun** (valores canônicos, não só CPU-vs-GPU): população **36/41/46** nas gerações 0/30/60 em grid 128², e os offsets exatos dos gliders emitidos (fixados no teste, derivados da referência CPU e conferidos contra as populações canônicas).
@@ -57,32 +57,38 @@ O harness (`tests/run.js`, Playwright + Chromium headless) roda **49 verificaç�
 - Uploads únicos de clear/randomize (contadores de `texSubImage2D`/`texImage2D`/`deleteTexture` no protótipo WebGL).
 - **Higiene do loop**: 0 `readPixels` e 0 alocações de GL no loop de render; sem erros de página em toda a suíte.
 - HUD (formato, cadência ~1 Hz) e determinismo do `?seed=`.
+- **Byte layout (Stage 6):** células morta/viva com máscaras Conway gravadas, idade que sobe 1 por geração e satura em 127, morte zerando a idade e mantendo as máscaras (via `readRaw`).
 
 O `readPixels` acontece **exclusivamente** no caminho de validação/teste, fora do `requestAnimationFrame`.
 
 ## Resultados medidos
 
-Ambiente: Chromium headless + **SwiftShader (rasterizador por software)** — ou seja, roda a CPU, não a GPU. Máquina de medição: Linux x86_64 (out/2026). Página isolada por medição, janela de 2 s.
+Ambiente: Chromium headless + **SwiftShader (rasterizador por software)** — ou seja, roda a CPU, não a GPU. Máquina de medição: Linux x86_64 (out/2026). Página isolada por medição, janela de 2 s. Números absolutos variam com a carga da máquina; o que importa são as **classes** (display independe do grid; sim cresce com O(size²)).
 
-| Cenário | fps | Observação |
+| Cenário (Stage 6 — byte layout) | fps | Observação |
 |---|---|---|
-| Só display (sim pausada) @64² | ~27 | Display amostra a textura na tela. |
-| Só display (sim pausada) @4096² | ~27 | **Igual à 64²** — o custo do display é O(pixels de tela), não O(grid). |
+| Só display (sim pausada) @64² | ~60 | Display amostra a textura na tela. |
+| Só display (sim pausada) @4096² | ~60 | **Igual à 64²** — o custo do display é O(pixels de tela), não O(grid). |
 | Sim + display @64² (`sps=120`) | ~162 | 64² fragmentos de sim são triviais. |
-| Sim + display @4096² (`sps=120`) | **~4.5** | 16.7M fragmentos × 9 `texelFetch` no rasterizador de **software**. |
+| Sim + display @4096² (`sps=120`) | **~4.5–10.5** | 16.7M fragmentos × 9 `texelFetch` no rasterizador de **software**. |
 
-**Análise (evidência de profiling):** o shader de sim é O(size²) em fragmentos. Sob SwiftShader isso vira ~16.7M iterações de shader por geração na CPU — o gargalo é o rasterizador de software, não o código. Os testes de higiene e de classe (4096 display na mesma classe que 64²) mostram que não há regressão arquitetural; em GPU real o fragmento shader de 16.7M texels é exatamente o tipo de carga paralela que placa gráfica resolve (o display-only @4096² já sai a ~27 fps no mesmo software).
+Referência da Stage 5 (antes do byte layout, sob carga alta): display ~27 fps em 64² **e** 4096²; sim+display ~146–162 fps @64², ~4.5–6 fps @4096² — o decode por round-trip da Stage 6 é neutro dentro da variância de carga (o custo dominante continua sendo o rasterizador de software).
 
-> **Sign-off do alvo de 60 fps (owner):** os números acima são de software GL (Chromium headless + SwiftShader). **Assinado e aceito pelo owner** — a meta de ~60 fps @4096² fica documentada como pendente de validação em hardware real; o shortfall (4.5–6 fps em software vs alvo) está aprovado como resultado do rasterizador de software, não como regressão arquitetural (evidência: display-only ~27 fps em 64² **e** 4096², sim+display 146–162 fps @64²). Números de GPU real, quando medidos, vão para a tabela acima *(issue #5 — critério de aceite fechado com sign-off)*.
+**Análise (evidência de profiling):** o shader de sim é O(size²) em fragmentos. Sob SwiftShader isso vira ~16.7M iterações de shader por geração na CPU — o gargalo é o rasterizador de software, não o código. Os testes de higiene e de classe (display @4096² na mesma classe que @64²) mostram que não há regressão arquitetural; em GPU real o fragmento shader de 16.7M texels é exatamente o tipo de carga paralela que placa gráfica resolve.
+
+> **Sign-off do alvo de 60 fps (owner):** os números acima são de software GL (Chromium headless + SwiftShader). **Assinado e aceito pelo owner** — a meta de ~60 fps @4096² fica documentada como pendente de validação em hardware real; o shortfall (4.5–10 fps em software vs alvo) está aprovado como resultado do rasterizador de software, não como regressão arquitetural (evidência: display-only igual em 64² **e** 4096², sim+display 146–162 fps @64²). Números de GPU real, quando medidos, vão para a tabela acima *(issue #5 — critério de aceite fechado com sign-off)*.
 
 ## Encoding da regra e da malha
 
 - **1 texel = 1 célula**; o estado vive em duas texturas RGBA8 em ping-pong (`textures[read]` → `textures[write]`), cada uma com seu FBO.
-- **Canal R** = viva (1.0) / morta (0.0); G/B sem uso; A = 255 no upload. O display pinta célula viva em `rgb(235,240,255)` e morta em `rgb(11,11,16)`.
+- **Byte layout por texel** (Stage 6): `R = (idade << 1) | viva` (idade = gerações consecutivas vivas, satura em 127); `G = máscara de nascimento` (bit n = nasce com n vizinhos; Conway B3 = `0b00001000`); `B = máscara de sobrevivência` (Conway S23 = `0b00001100`); `A = bit0 nasce com 8, bit1 sobrevive com 8, bits 2-7 id de linhagem` (0 no modo Conway).
+- **Encoding normalizado:** RGBA8UI (renderização para texturas inteiras) não está disponível no stack de referência — sem `EXT_color_buffer_integer`, draws em FBOs inteiros produzem lixo (evidência na issue #6). Os bytes viajam como floats normalizados (v/255) e os shaders decodificam com `int(v * 255.0 + 0.5)` — **lossless para todos os 256 valores de byte** em highp, portável em qualquer WebGL2. Acima da linha de decode, o layout é byte a byte o especificado.
 - **Linha de base:** índice `y * size + x`, com `y = 0` na **base** (`gl_FragCoord` é y-up; o upload via `texSubImage2D` usa a mesma convenção).
-- **Regra B3/S23** em `shaders/sim.frag.glsl`: `alive = (n == 3) || (self && n == 2)`, com vizinhança por `texelFetch` + módulo `(q + size) % size` (toro). Zero depender de textura wrap na sim; o display e os uploads usam `REPEAT`.
-- **Pintura/patterns** entram por `texSubImage2D` direto na textura viva (até 4 splits quando o retângulo cruza a borda). Sem shader de stamping extra, sem alocação por evento (`patchBuf`/`packBuf` alocados uma vez).
+- **Regra B3/S23** em `shaders/sim.frag.glsl` (Stage 6): a expressão Conway `alive = (n == 3) || (self && n == 2)` indexada pelo **bit0 de R**; máscara G/B/A são gravadas mas **ainda não consumidas** (consumo de genoma chega na Stage 7). Vizinhança por `texelFetch` + módulo `(q + size) % size` (toro).
+- Display pinta célula viva em `rgb(235,240,255)` e morta em `rgb(11,11,16)`, decodificando o bit0.
+- **Pintura/patterns/seed** entram por `texSubImage2D` direto na textura viva (até 4 splits quando o retângulo cruza a borda), escrevendo o byte layout (viva = `(1,8,12,0)`, morta = `(0,8,12,0)`). Sem alocação por evento (`patchBuf`/`packBuf`/`fullBuf` alocados uma vez).
 - A próxima geração é **consumida do texel `read`** no passo seguinte — pinturas caem estritamente entre passos (single-threaded).
+- Hooks de validação: `__life.read()` devolve canal 0 como 0/255 (contrato do harness); `__life.readRaw()` devolve os bytes brutos do layout — só fora do loop.
 
 ## Como foi desenvolvido
 
