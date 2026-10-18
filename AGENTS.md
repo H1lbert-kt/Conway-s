@@ -14,18 +14,3 @@ Conway's Game of Life (B3/S23) in the browser, focused on **millions of cells at
 8. **Performance first:** any change that drops FPS on a 4096×4096 grid must be justified or reverted.
 9. **Small, simple files:** one `index.html`, one `main.js`, separate shaders. Don't create extra structure unless I ask.
 10. **Don't add features I didn't ask for.** When in doubt, ask first.
-
-## Workflow: one stage = one GitHub issue
-
-The issue is the single source of truth for each stage. Uses the `gh` CLI.
-Planning is done by `/gt next` (plan mode). Implementation is done in build mode.
-
-### Build mode
-1. Read the issue and its latest plan (`gh issue view <number> --comments`) before touching any code.
-2. Implement only what the plan says. Anything outside it needs my approval first.
-3. Implement the tests the stage plan requires (`npm test`). Run them; every criterion must be backed by a passing test when possible.
-4. Check off acceptance criteria in the issue as they are met (`gh issue edit <number> --body-file -`). Never remove or rewrite the original description or the plan.
-5. Commit and push only via `/cp` (use `/cp gt` to reference the current stage issue). Never run `git commit`/`git push` directly.
-6. Never create, close, or delete issues. Closing is done only by `/gt next`.
-7. If the plan and the code disagree, stop and tell me. Update the issue first, then continue.
-8. Do not start the next stage. Stop when all criteria of the current one are checked.

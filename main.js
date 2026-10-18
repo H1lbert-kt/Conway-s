@@ -127,9 +127,14 @@ const PATTERNS = {
 
 const MAX_BRUSH_SIDE = 65;
 const MAX_STEPS_PER_FRAME = 8;
-// Conway masks in the byte layout (stage 6): G = birth mask, B = survival mask.
-const CONWAY_BIRTH_MASK = 0x08; // B3 = born with 3 neighbors
-const CONWAY_SURV_MASK = 0x0c; // S23 = survives with 2 or 3 neighbors
+// Genome presets: G = birth mask, B = survival mask (byte layout, stage 6+).
+const GENOME_PRESETS = {
+  conway: { birth: 0x08, surv: 0x0c }, // B3/S23
+  highlife: { birth: 0x48, surv: 0x0c }, // B36/S23
+};
+const DEFAULT_GENOME = 'conway';
+// Hash seed for genome inheritance (stage 8 wires ?seed= here).
+const HASH_SEED = 0;
 
 async function main() {
   const sources = await Promise.all([
@@ -144,6 +149,8 @@ async function main() {
     uState: gl.getUniformLocation(simProgram, 'uState'),
     uSize: gl.getUniformLocation(simProgram, 'uSize'),
     uWrap: gl.getUniformLocation(simProgram, 'uWrap'),
+    uGen: gl.getUniformLocation(simProgram, 'uGen'),
+    uSeed: gl.getUniformLocation(simProgram, 'uSeed'),
   };
   const displayLoc = {
     uState: gl.getUniformLocation(displayProgram, 'uState'),
@@ -160,6 +167,7 @@ async function main() {
   let read = 0;
   let write = 1;
   let generation = 0;
+  let activeGenome = GENOME_PRESETS[DEFAULT_GENOME];
 
   let camX = 0;
   let camY = 0;
@@ -175,6 +183,7 @@ async function main() {
   let painting = 0;
   let brushRadius = 2;
   let selectedPattern = 'brush';
+  let selectedGenome = DEFAULT_GENOME;
 
   const patchBuf = new Uint8Array(MAX_BRUSH_SIDE * MAX_BRUSH_SIDE * 4);
   const packBuf = new Uint8Array(MAX_BRUSH_SIDE * MAX_BRUSH_SIDE * 4);
@@ -216,6 +225,8 @@ async function main() {
     gl.uniform1i(simLoc.uState, 0);
     gl.uniform1i(simLoc.uSize, size);
     gl.uniform1i(simLoc.uWrap, 1);
+    gl.uniform1i(simLoc.uGen, generation);
+    gl.uniform1ui(simLoc.uSeed, HASH_SEED);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     read = write;
     write ^= 1;
@@ -278,8 +289,8 @@ async function main() {
     const n = side * side;
     for (let i = 0; i < n; i++) {
       patchBuf[i * 4] = 1;
-      patchBuf[i * 4 + 1] = CONWAY_BIRTH_MASK;
-      patchBuf[i * 4 + 2] = CONWAY_SURV_MASK;
+      patchBuf[i * 4 + 1] = activeGenome.birth;
+      patchBuf[i * 4 + 2] = activeGenome.surv;
       patchBuf[i * 4 + 3] = 0;
     }
     uploadPatch(cx - r, cy - r, side, side, patchBuf);
@@ -291,8 +302,8 @@ async function main() {
     const n = p.w * p.h;
     for (let i = 0; i < n; i++) {
       patchBuf[i * 4] = p.bits[i] ? 1 : 0;
-      patchBuf[i * 4 + 1] = CONWAY_BIRTH_MASK;
-      patchBuf[i * 4 + 2] = CONWAY_SURV_MASK;
+      patchBuf[i * 4 + 1] = activeGenome.birth;
+      patchBuf[i * 4 + 2] = activeGenome.surv;
       patchBuf[i * 4 + 3] = 0;
     }
     uploadPatch(x0, y0, p.w, p.h, patchBuf);
@@ -302,8 +313,8 @@ async function main() {
     const n = size * size;
     for (let i = 0; i < n; i++) {
       fullBuf[i * 4] = 0;
-      fullBuf[i * 4 + 1] = CONWAY_BIRTH_MASK;
-      fullBuf[i * 4 + 2] = CONWAY_SURV_MASK;
+      fullBuf[i * 4 + 1] = activeGenome.birth;
+      fullBuf[i * 4 + 2] = activeGenome.surv;
       fullBuf[i * 4 + 3] = 0;
     }
     uploadPatch(0, 0, size, size, fullBuf);
@@ -313,8 +324,8 @@ async function main() {
     const n = size * size;
     for (let i = 0; i < n; i++) {
       fullBuf[i * 4] = Math.random() < 0.5 ? 0 : 1;
-      fullBuf[i * 4 + 1] = CONWAY_BIRTH_MASK;
-      fullBuf[i * 4 + 2] = CONWAY_SURV_MASK;
+      fullBuf[i * 4 + 1] = activeGenome.birth;
+      fullBuf[i * 4 + 2] = activeGenome.surv;
       fullBuf[i * 4 + 3] = 0;
     }
     uploadPatch(0, 0, size, size, fullBuf);
@@ -327,8 +338,8 @@ async function main() {
     const n = size * size;
     for (let i = 0; i < n; i++) {
       fullBuf[i * 4] = rnd() < 0.5 ? 0 : 1;
-      fullBuf[i * 4 + 1] = CONWAY_BIRTH_MASK;
-      fullBuf[i * 4 + 2] = CONWAY_SURV_MASK;
+      fullBuf[i * 4 + 1] = activeGenome.birth;
+      fullBuf[i * 4 + 2] = activeGenome.surv;
       fullBuf[i * 4 + 3] = 0;
     }
     uploadPatch(0, 0, size, size, fullBuf);
@@ -430,6 +441,7 @@ async function main() {
   const btnPaint = document.getElementById('btn-paint');
   const elBrush = document.getElementById('brush-size');
   const elPattern = document.getElementById('pattern');
+  const elGenome = document.getElementById('genome');
 
   function updatePlayLabel() {
     btnPlay.textContent = auto ? 'Pause' : 'Play';
@@ -458,6 +470,15 @@ async function main() {
   });
   elBrush.addEventListener('input', function () { brushRadius = Math.floor(elBrush.valueAsNumber / 2); });
   elPattern.addEventListener('change', function () { selectedPattern = elPattern.value; });
+  elGenome.addEventListener('change', function () { setGenome(elGenome.value); });
+
+  function setGenome(name) {
+    const preset = GENOME_PRESETS[name];
+    if (!preset) return false;
+    selectedGenome = name;
+    activeGenome = preset;
+    return true;
+  }
 
   const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
   const maxAllowed = Math.min(4096, maxTextureSize);
@@ -479,13 +500,13 @@ async function main() {
     },
     seed: function (w, h, data) {
       // Test-seed API stays "RGBA bytes with R>127 = alive"; convert in place to
-      // the Conway byte layout (validation path, never inside frame()).
+      // the active genome's byte layout (validation path, never inside frame()).
       const n = w * h;
       for (let i = 0; i < n; i++) {
         const alive = data[i * 4] > 127 ? 1 : 0;
         data[i * 4] = alive;
-        data[i * 4 + 1] = CONWAY_BIRTH_MASK;
-        data[i * 4 + 2] = CONWAY_SURV_MASK;
+        data[i * 4 + 1] = activeGenome.birth;
+        data[i * 4 + 2] = activeGenome.surv;
         data[i * 4 + 3] = 0;
       }
       gl.bindTexture(gl.TEXTURE_2D, textures[read]);
@@ -525,6 +546,7 @@ async function main() {
     stampPattern: stampPattern,
     clear: clearGrid,
     randomize: randomize,
+    setGenome: setGenome,
   };
 
   window.addEventListener('resize', resize);

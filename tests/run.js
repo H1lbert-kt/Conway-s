@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Validation suite for Conway's Game of Life (B3/S23, WebGL2).
 // Stages covered: 1 (scaffold/context) and 2 (GPU simulation core).
-// Run: npm test   (requires Node 18+ and a Chromium binary; see findChromium).
+// Run: pnpm test   (requires Node 18+ and a Chromium binary; see findChromium).
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -65,6 +65,81 @@ function cpuStep(grid, size) {
       }
       const self = grid[y * size + x];
       next[y * size + x] = (n === 3 || (self && n === 2)) ? 1 : 0;
+    }
+  }
+  return next;
+}
+
+// Stage 7: 32-bit cell hash, bit-for-bit mirror of hashCell() in sim.frag.glsl.
+// GLSL uint multiply wraps mod 2^32 == Math.imul low bits; >> on uint == >>>.
+function hashCell(x, y, g, s) {
+  let h = s >>> 0;
+  h = (h ^ Math.imul(x >>> 0, 374761393)) >>> 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177) >>> 0;
+  h = (h ^ Math.imul(y >>> 0, 2654435761)) >>> 0;
+  h = Math.imul(h ^ (h >>> 16), 2246822519) >>> 0;
+  h = (h ^ Math.imul(g >>> 0, 3266489917)) >>> 0;
+  h = Math.imul(h ^ (h >>> 15), 3266489917) >>> 0;
+  h = (h ^ (h >>> 16)) >>> 0;
+  return h >>> 0;
+}
+
+// Stage 7: CPU reference over the full RGBA byte layout (masks + hash inheritance).
+// state: Uint8Array size*size*4; gen = generation this step computes from; seed = hash seed.
+function cpuStepGenome(state, size, gen, seed) {
+  const next = new Uint8Array(size * size * 4);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      let n = 0;
+      const living = [];
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          if (dx === 0 && dy === 0) continue;
+          const qx = (x + dx + size) % size;
+          const qy = (y + dy + size) % size;
+          const i = (qy * size + qx) * 4;
+          if (state[i] & 1) {
+            n++;
+            living.push((state[i + 1] | (state[i + 2] << 8) | ((state[i + 3] & 3) << 16)) >>> 0);
+          }
+        }
+      }
+      const si = (y * size + x) * 4;
+      const r = state[si];
+      const g = state[si + 1];
+      const b = state[si + 2];
+      const a = state[si + 3];
+      const selfAlive = (r & 1) === 1;
+      let alive;
+      if (n === 8) {
+        alive = selfAlive ? ((a & 2) !== 0) : ((a & 1) !== 0);
+      } else {
+        alive = selfAlive ? (((b >> n) & 1) !== 0) : (((g >> n) & 1) !== 0);
+      }
+      let outR = 0;
+      let outG = g;
+      let outB = b;
+      let outA = a;
+      if (alive) {
+        let age = r >> 1;
+        if (age < 127) age += 1;
+        outR = (age << 1) | 1;
+        if (!selfAlive) {
+          let genome;
+          if (living.length > 0) {
+            genome = living[hashCell(x, y, gen, seed) % living.length];
+          } else {
+            genome = (g | (b << 8) | ((a & 3) << 16)) >>> 0;
+          }
+          outG = genome & 0xFF;
+          outB = (genome >> 8) & 0xFF;
+          outA = (a & 0xFC) | ((genome >> 16) & 3);
+        }
+      }
+      next[si] = outR;
+      next[si + 1] = outG;
+      next[si + 2] = outB;
+      next[si + 3] = outA;
     }
   }
   return next;
@@ -852,6 +927,110 @@ async function main() {
     const diedCell = await raw1(page, 29, 30);
     record('stage6: death resets age to 0 and keeps Conway masks',
       diedCell.join() === '0,8,12,0', `died=[${diedCell}]`);
+  }
+
+  // ---- Stage 7: per-cell genomes, mask consumption, deterministic inheritance ----
+  {
+    // Stage 4 left the shared page on a 4096² grid; reload at SIZE so the torus
+    // wrap matches the 64² CPU references below.
+    await page.goto(`${base}?size=${SIZE}&sps=0.0001`);
+    await page.waitForFunction(() => !!window.__life || !!document.getElementById('error'));
+    await page.evaluate(() => window.__life.setAuto(false));
+    const raw1 = (p, x, y) => p.evaluate(
+      (coords) => Array.from(window.__life.readRaw(coords[0], coords[1], 1, 1)), [x, y],
+    );
+
+    // Stamp with HighLife selected: readRaw shows G=0b01001000 (B36), B=0b00001100 (S23).
+    // Then back to Conway: stamp shows G=0x08.
+    await page.evaluate(() => {
+      window.__life.setAuto(false);
+      window.__life.setGenome('highlife');
+      window.__life.clear();
+      window.__life.stampBrush(10, 10, 0);
+    });
+    const hlStamp = await raw1(page, 10, 10);
+    await page.evaluate(() => {
+      window.__life.setGenome('conway');
+      window.__life.clear();
+      window.__life.stampBrush(11, 11, 0);
+    });
+    const cwStamp = await raw1(page, 11, 11);
+    record('stage7: brush stamping uses selected genome (HighLife G=0x48/B=0x0C, Conway G=0x08)',
+      hlStamp.join() === '1,72,12,0' && cwStamp.join() === '1,8,12,0',
+      `highlife=[${hlStamp}] conway=[${cwStamp}]`);
+
+    // Inheritance: blinker of HighLife cells; the cell above the center is born with
+    // n==3 from three living HighLife neighbors and must inherit G=0x48/B=0x0C.
+    await page.evaluate(() => {
+      window.__life.setGenome('highlife');
+      window.__life.clear();
+      window.__life.stampPattern('blinker', 20, 30);
+      window.__life.step(1);
+    });
+    const inherited = await raw1(page, 21, 31);
+    record('stage7: newborn inherits HighLife genome from living neighbors',
+      inherited.join() === '3,72,12,0', `inherited=[${inherited}]`);
+
+    // n==8 corner: 3x3 solid block — center has n==8 and must die (A bit1 = 0 for
+    // Conway/HighLife), matching cpuStepGenome which takes the same A-bits path.
+    await page.evaluate(() => {
+      window.__life.setGenome('conway');
+      window.__life.clear();
+      for (let y = 9; y <= 11; y++) {
+        for (let x = 9; x <= 11; x++) window.__life.stampBrush(x, y, 0);
+      }
+    });
+    const n8State0 = await page.evaluate(() => Array.from(window.__life.readRaw(0, 0, 64, 64)));
+    await page.evaluate(() => window.__life.step(1));
+    const n8Gpu = await page.evaluate(() => Array.from(window.__life.readRaw(0, 0, 64, 64)));
+    const n8Cpu = cpuStepGenome(Uint8Array.from(n8State0), 64, 0, 0);
+    let n8Mismatch = 0;
+    for (let i = 0; i < n8Cpu.length; i++) if (n8Cpu[i] !== n8Gpu[i]) n8Mismatch++;
+    const centerAfter = await raw1(page, 10, 10);
+    record('stage7: n==8 indexes A bits (center of 3x3 solid dies; GPU matches CPU)',
+      n8Mismatch === 0 && centerAfter.join() === '0,8,12,0',
+      `mismatches=${n8Mismatch} center=[${centerAfter}]`);
+
+    // Mixed-genome equivalence: half Conway / half HighLife + crossing gliders;
+    // GPU vs cpuStepGenome — full uvec4 grids equal after 50 gens (hash parity).
+    await page.evaluate(() => {
+      window.__life.setGenome('conway');
+      window.__life.clear();
+      for (let y = 0; y < 64; y++) {
+        for (let x = 0; x < 64; x++) {
+          const left = x < 32;
+          const alive = left ? ((x * 3 + y * 5) % 7 < 3) : ((x * 5 + y * 3) % 11 < 4);
+          if (alive) {
+            window.__life.setGenome(left ? 'conway' : 'highlife');
+            window.__life.stampBrush(x, y, 0);
+          }
+        }
+      }
+      window.__life.setGenome('conway');
+      window.__life.stampPattern('glider', 28, 28);
+      window.__life.setGenome('highlife');
+      window.__life.stampPattern('glider', 36, 24);
+      window.__life.setGenome('conway');
+    });
+    const mixed0 = await page.evaluate(() => Array.from(window.__life.readRaw(0, 0, 64, 64)));
+    const mixedGen0 = await page.evaluate(() => window.__life.generation());
+    await page.evaluate(() => window.__life.step(50));
+    const mixedGpu = await page.evaluate(() => Array.from(window.__life.readRaw(0, 0, 64, 64)));
+    let mixedCpu = Uint8Array.from(mixed0);
+    for (let g = 0; g < 50; g++) mixedCpu = cpuStepGenome(mixedCpu, 64, mixedGen0 + g, 0);
+    let mixedMismatch = 0;
+    let firstBad = -1;
+    for (let i = 0; i < mixedCpu.length; i++) {
+      if (mixedCpu[i] !== mixedGpu[i]) {
+        mixedMismatch++;
+        if (firstBad < 0) firstBad = i;
+      }
+    }
+    record('stage7: mixed Conway/HighLife grid matches CPU reference for 50 gens (hash parity)',
+      mixedMismatch === 0,
+      mixedMismatch
+        ? `${mixedMismatch} byte mismatches, first @${firstBad}: cpu=[${mixedCpu.slice(firstBad, firstBad + 4)}] gpu=[${mixedGpu.slice(firstBad, firstBad + 4)}]`
+        : 'bit-exact over 50 gens');
   }
 
   // ---- Loop hygiene with auto stepping on (second page) ----
