@@ -23,7 +23,8 @@ Qualquer servidor estático serve (`npx serve`, `php -S`, etc.). Não há build,
 |---|---|
 | `?size=2048` | Tamanho do grid (potência de 2, limitado por `min(4096, MAX_TEXTURE_SIZE)`). Padrão: 1024. |
 | `?sps=30` | Gerações por segundo iniciais (1–120 via slider; o parâmetro é o valor de carga). |
-| `?seed=demo` | Estado inicial determinístico (PRNG mulberry32 com seed fixa). `?seed=<n>` usa o inteiro informado. Sem parâmetro: grid vazio. |
+| `?seed=demo` | Estado inicial determinístico (PRNG mulberry32 com seed fixa). `?seed=<n>` usa o inteiro informado. Sem parâmetro: grid vazio. A seed também alimenta o hash de herança/mutação da simulação (mesmo mapeamento do fill: `demo` → constante fixa, ausente → 0, senão o inteiro) — loadings iguais evoluem bit-identicalmente. |
+| `?mut=0.05` | Taxa de mutação por nascimento, em fração (0–1; clampado). Padrão: 0 (sem mutação, comportamento Stage 7 bit-exato). Cada nascimento sorteia via hash: com probabilidade `mut` flipa 1 dos 18 bits de regra e o recém-nascido ganha uma linhagem nova (id 1–63). Ver “Mutação e linhagens”. |
 
 ## Controles
 
@@ -49,7 +50,7 @@ pnpm install   # só playwright-core, dev-dependency do harness
 pnpm test
 ```
 
-O harness (`tests/run.js`, Playwright + Chromium headless) roda **56 verificações** (os 49 testes originais, intocados, + 3 da Stage 6, + 4 da Stage 7) e imprime PASS/FAIL por critério, com exit code ≠ 0 em falha. Ele valida:
+O harness (`tests/run.js`, Playwright + Chromium headless) roda **61 verificações** (os 49 testes originais, intocados, + 3 da Stage 6, + 4 da Stage 7, + 5 da Stage 8) e imprime PASS/FAIL por critério, com exit code ≠ 0 em falha. Ele valida:
 
 - **Fidelidade bit-a-bit contra uma referência CPU da B3/S23**: blinker, block, glider (interior e **atravessando a costura do toro**), e Gosper gun por 60 gerações.
 - **Golden do Gosper gun** (valores canônicos, não só CPU-vs-GPU): população **36/41/46** nas gerações 0/30/60 em grid 128², e os offsets exatos dos gliders emitidos (fixados no teste, derivados da referência CPU e conferidos contra as populações canônicas).
@@ -60,20 +61,22 @@ O harness (`tests/run.js`, Playwright + Chromium headless) roda **56 verificaç�
 - HUD (formato, cadência ~1 Hz) e determinismo do `?seed=`.
 - **Byte layout (Stage 6):** células morta/viva com máscaras Conway gravadas, idade que sobe 1 por geração e satura em 127, morte zerando a idade e mantendo as máscaras (via `readRaw`).
 - **Genoma por célula (Stage 7):** stamping com os presets Conway/HighLife afirmado via `readRaw`, nascimento herdando o genoma do vizinho escolhido pelo hash, n==8 indexando os bits do canal A, e grid misto Conway/HighLife bit-exato (uvec4) contra a referência CPU por 50 gerações — a prova de paridade do hash JS/GLSL (qualquer divergência diverge rápido).
+- **Mutação e linhagens (Stage 8):** `mut=0`/ausente mantém o comportamento Stage 7 bit-exato e todos os ids de linhagem em 0; `mut=0.15` produz ids distintos em A bits2–7 com o grid GPU bit-exato (uvec4) contra a referência CPU com mutação por 50 gerações; cor: linhagem 0 mantém o branco-clássico e célula mutada bate (±8) com a referência HSL computada no teste para o id dela; HUD pausado conta as linhagens vivas (mundo Conway puro = 1, após mutações ≥ 2); e determinismo: duas loads com o mesmo `?seed=`+`?mut=` evoluem idênticas, com `?mut=` diferente divergem.
 
-O `readPixels` acontece **exclusivamente** no caminho de validação/teste, fora do `requestAnimationFrame`.
+O `readPixels` acontece **exclusivamente fora do stepping automático**: no caminho de validação/teste e no tick de 1 Hz do HUD **somente com a simulação pausada** — nunca em handlers de input nem durante o stepping (comprovado pelo teste de higiene: 0 `readPixels` durante a medição com auto-stepping ligado).
 
 ## Resultados medidos
 
 Ambiente: Chromium headless + **SwiftShader (rasterizador por software)** — ou seja, roda a CPU, não a GPU. Máquina de medição: Linux x86_64 (out/2026). Página isolada por medição, janela de 2 s. Números absolutos variam com a carga da máquina; o que importa são as **classes** (display independe do grid; sim cresce com O(size²)).
 
-| Cenário (Stage 7 — genoma por célula) | fps | Observação |
+| Cenário | fps | Observação |
 |---|---|---|
 | Só display (sim pausada) @64² | ~60 | Display amostra a textura na tela. |
 | Só display (sim pausada) @4096² | ~60 | **Igual à 64²** — o custo do display é O(pixels de tela), não O(grid). |
 | Sim + display @64² (`sps=120`) | ~163 | 64² fragmentos de sim são triviais. |
 | Sim + display @4096² (`sps=120`) | **~4.5–10.5** | 16.7M fragmentos × 9 `texelFetch` no rasterizador de **software**. |
 | Sim + display @4096², Stage 7 (perfil da suíte) | **~5.5** | Regra por máscara + herança ativas: dentro da faixa da Stage 6 (4.5–10.5) — custo extra ≈ 0, os canais vêm dos mesmos 9 `texelFetch`. |
+| Sim + display @4096², Stage 8 (`mut=0`, default) | **na mesma faixa** | `mut=0` mantém exatamente o caminho de código da Stage 7 (branch de mutação não entra; mesmo hash de herança por nascimento) — custo extra ≈ 0. Com `?mut>0` o custo é ~1 hash adicional por nascimento, o mesmo custo por nascimento já existente do herding. |
 
 Referência da Stage 5 (antes do byte layout, sob carga alta): display ~27 fps em 64² **e** 4096²; sim+display ~146–162 fps @64², ~4.5–6 fps @4096² — o decode por round-trip da Stage 6 é neutro dentro da variância de carga (o custo dominante continua sendo o rasterizador de software).
 
@@ -87,7 +90,7 @@ Referência da Stage 5 (antes do byte layout, sob carga alta): display ~27 fps e
 - **Byte layout por texel** (Stage 6): `R = (idade << 1) | viva` (idade = gerações consecutivas vivas, satura em 127); `G = máscara de nascimento` (bit n = nasce com n vizinhos; Conway B3 = `0b00001000`); `B = máscara de sobrevivência` (Conway S23 = `0b00001100`); `A = bit0 nasce com 8, bit1 sobrevive com 8, bits 2-7 id de linhagem` (0 no modo Conway).
 - **Encoding normalizado:** RGBA8UI (renderização para texturas inteiras) não está disponível no stack de referência — sem `EXT_color_buffer_integer`, draws em FBOs inteiros produzem lixo (evidência na issue #6). Os bytes viajam como floats normalizados (v/255) e os shaders decodificam com `int(v * 255.0 + 0.5)` — **lossless para todos os 256 valores de byte** em highp, portável em qualquer WebGL2. Acima da linha de decode, o layout é byte a byte o especificado.
 - **Linha de base:** índice `y * size + x`, com `y = 0` na **base** (`gl_FragCoord` é y-up; o upload via `texSubImage2D` usa a mesma convenção).
-- **Regra por genoma (Stage 7)** em `shaders/sim.frag.glsl`: célula morta indexa a **máscara de nascimento** `G[n]` (viva indexa a **máscara de sobrevivência** `B[n]`); `n == 8` indexa os bits do canal A (`A bit0` = nasce com 8, `A bit1` = sobrevive com 8). Ao nascer, a célula herda o genoma empacotado (G | B<<8 | A bits0–1 <<16) do vizinho vivo escolhido por `hash(x, y, gen, seed) % livingCount` na ordem fixa de varredura (dy, dx ascendente); nascimentos sem vizinhos vivos (máscara B0) mantêm o próprio genoma do texel. Com todas as máscaras em Conway (o default), herdar = manter — os goldens continuam bit-exatos com o caminho novo ativo. Vizinhança por `texelFetch` + módulo `(q + size) % size` (toro).
+- **Regra por genoma (Stage 7) + mutação (Stage 8)** em `shaders/sim.frag.glsl`: célula morta indexa a **máscara de nascimento** `G[n]` (viva indexa a **máscara de sobrevivência** `B[n]`); `n == 8` indexa os bits do canal A (`A bit0` = nasce com 8, `A bit1` = sobrevive com 8). Ao nascer, a célula herda o genoma empacotado (**24 bits**: `G | B<<8 | A<<16`, linhagem incluída) do vizinho vivo escolhido por `hash(x, y, gen, seed) % livingCount` na ordem fixa de varredura (dy, dx ascendente); nascimentos sem vizinhos vivos (máscara B0) mantêm o próprio genoma do texel. Com todas as máscaras em Conway (o default), herdar = manter — os goldens continuam bit-exatos com o caminho novo ativo. Vizinhança por `texelFetch` + módulo `(q + size) % size` (toro).
 - **Hash de herança (32-bit, idêntico em GLSL e JS)** — mesmo número de constantes, mesma ordem de operações:
 
   ```glsl
@@ -111,8 +114,9 @@ Referência da Stage 5 (antes do byte layout, sob carga alta): display ~27 fps e
   h = (h ^ (h >>> 16)) >>> 0;
   ```
 
-  `Math.imul` devolve os bits 0–31 do produto (idênticos ao multiply-wrap de `uint`); `>>> 0` normaliza para unsigned, e `>>>`/`^` sobre valores em [0, 2³²) equivalem aos shifts/XOR lógicos de `uint`. `seed` é `HASH_SEED = 0` em `main.js` (a issue #8 pode ligar `?seed=`); `gen` é a geração de partida do passo (`uGen`).
-- Display pinta célula viva em `rgb(235,240,255)` e morta em `rgb(11,11,16)`, decodificando o bit0.
+  `Math.imul` devolve os bits 0–31 do produto (idênticos ao multiply-wrap de `uint`); `>>> 0` normaliza para unsigned, e `>>>`/`^` sobre valores em [0, 2³²) equivalem aos shifts/XOR lógicos de `uint`. `seed` vem do parâmetro `?seed=` (mesmo mapeamento do fill determinístico: `demo` → constante fixa, ausente → 0, senão o inteiro); `gen` é a geração de partida do passo (`uGen`). O mesmo hash decide, no nascimento, o vizinho doador do genoma **e** (quando `?mut>0`) a rolagem de mutação e o id de linhagem novo — é por isso que loads iguais de `?seed=`+`?mut=` evoluem bit-identicalmente.
+- Display pinta célula morta em `rgb(11,11,16)` e viva por **linhagem** (A bits2–7): id 0 mantém o clássico `rgb(235,240,255)`; ids 1–63 usam HSL com matiz de ângulo dourado (`fract(id × 0.6180339887) × 360°`, S=0.65, L=0.55), decodificado no próprio fragment shader (`hsl2rgb`, sem LUT).
+- **Mutação e linhagens (Stage 8):** `?mut=` vira `mutBp` em pontos-base fixos (0–10000, clampado) — a comparação no shader é inteira (`h % 10000u < uMutBp`), sem floats cross-language. No nascimento, se a rolagem passa: `genome ^= 1u << ((h/10000u)%18u)` flipa 1 dos 18 bits de regra (domínio 0..17) e o recém-nascido recebe linhagem nova `1 + ((h>>9)%63)` em A bits2–7 (o XOR sempre muda o pack, então **todo evento de mutação recebe id novo**; sobreviventes e células stampadas **nunca** mudam de id). Mundo só com id 0 é bit-exato da Stage 7. O HUD, **só quando pausado**, mostra `| lineages: N` — contagem por um único `readPixels` full-grid + scan de 64 flags em JS, executada **exclusivamente no tick pausado de 1 Hz** (nunca durante o stepping automático e nunca dentro de handlers de input: a primeira sincronização de leitura depois de uma sessão de jogo drena a fila de software-GL acumulada — medido ~49 s em 4096² contra ~110 ms no estado estável — e bloquearia o dispatch de cliques; no tick, o valor aparece no máximo 1 s após pausar; o teste de higiene garante 0 `readPixels` com auto ligado).
 - **Pintura/patterns/seed** entram por `texSubImage2D` direto na textura viva (até 4 splits quando o retângulo cruza a borda), escrevendo o byte layout com as máscaras do **genoma selecionado** (viva = `(1, G, B, 0)`, morta = `(0, G, B, 0)`; Conway = `(1,8,12,0)` / `(0,8,12,0)`). Sem alocação por evento (`patchBuf`/`packBuf`/`fullBuf` alocados uma vez).
 - A próxima geração é **consumida do texel `read`** no passo seguinte — pinturas caem estritamente entre passos (single-threaded).
 - Hooks de validação: `__life.read()` devolve canal 0 como 0/255 (contrato do harness); `__life.readRaw()` devolve os bytes brutos do layout — só fora do loop.
@@ -152,7 +156,13 @@ Labels: `stage` (toda issue de etapa), `planned` (planejada/em implementação),
 | 2 — Núcleo de simulação GPU (B3/S23, ping-pong) | #2 | fechada |
 | 3 — Renderização e câmera (pan/zoom) | #3 | fechada |
 | 4 — Interação, patterns e controles | #4 | fechada |
-| 5 — Validação e performance em escala | #5 | esta |
+| 5 — Validação e performance em escala | #5 | fechada |
+| 6 — Formato RGBA8UI + modo Conway equivalente | #6 | fechada |
+| 7 — Genoma por célula + herança determinística | #7 | fechada |
+| 8 — Mutação + linhagens + cor | #8 | esta |
+| 9 — Explorador de novidade (novelty search) | #9 | aberta |
+| 10 — Ecologia — seleção, energia, nicho, idade | #10 | aberta |
+| 11 — Experimentos de regras pouco exploradas | #11 | aberta |
 
 ## Regras do projeto
 

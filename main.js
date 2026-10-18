@@ -133,8 +133,6 @@ const GENOME_PRESETS = {
   highlife: { birth: 0x48, surv: 0x0c }, // B36/S23
 };
 const DEFAULT_GENOME = 'conway';
-// Hash seed for genome inheritance (stage 8 wires ?seed= here).
-const HASH_SEED = 0;
 
 async function main() {
   const sources = await Promise.all([
@@ -151,6 +149,7 @@ async function main() {
     uWrap: gl.getUniformLocation(simProgram, 'uWrap'),
     uGen: gl.getUniformLocation(simProgram, 'uGen'),
     uSeed: gl.getUniformLocation(simProgram, 'uSeed'),
+    uMutBp: gl.getUniformLocation(simProgram, 'uMutBp'),
   };
   const displayLoc = {
     uState: gl.getUniformLocation(displayProgram, 'uState'),
@@ -189,6 +188,34 @@ async function main() {
   const packBuf = new Uint8Array(MAX_BRUSH_SIDE * MAX_BRUSH_SIDE * 4);
   let fullBuf = new Uint8Array(size * size * 4);
 
+  // Stage 8: living-lineage count. Frozen rule 4 — readPixels only OUTSIDE the
+  // auto-stepping loop, and only from the paused 1 Hz HUD tick. Pause/step
+  // handlers and frame() never read back: the first readPixels after a playing
+  // session forces a deep software-GL queue to drain (measured ~49 s at 4096^2
+  // vs ~110 ms steady-state), which would block input dispatch and freeze the
+  // UI — deferring to the tick keeps handlers/frame input-responsive; the HUD
+  // lineages value appears at most 1 s after pausing.
+  // Buffers preallocated; no per-call allocation.
+  let countBuf = new Uint8Array(size * size * 4);
+  const lineageSeen = new Uint8Array(64);
+  let lineageCount = 1;
+  function countLineages() {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbos[read]);
+    gl.readPixels(0, 0, size, size, gl.RGBA, gl.UNSIGNED_BYTE, countBuf);
+    lineageSeen.fill(0);
+    let c = 0;
+    for (let i = 0; i < countBuf.length; i += 4) {
+      if (countBuf[i] & 1) {
+        const lid = (countBuf[i + 3] >> 2) & 63;
+        if (!lineageSeen[lid]) {
+          lineageSeen[lid] = 1;
+          c++;
+        }
+      }
+    }
+    lineageCount = c;
+  }
+
   function cellsY() {
     return cellsX * gl.drawingBufferHeight / gl.drawingBufferWidth;
   }
@@ -216,6 +243,21 @@ async function main() {
   let lastTime = -1;
   let accumulator = 0;
 
+  // Stage 8: ?mut= (0..1, default 0/off) as basis points for the shader's
+  // fixed-point compare; ?seed= drives BOTH the initial fill (seededFill) and
+  // the sim hash (uSeed) with the same mapping — full reproducibility from
+  // ?seed= + ?mut=.
+  const DEMO_SEED = 0x2F6E2B1;
+  const searchParams = new URLSearchParams(location.search);
+  const mutParam = Number(searchParams.get('mut'));
+  const mutBp = Number.isFinite(mutParam) && mutParam > 0
+    ? Math.min(10000, Math.round(mutParam * 10000))
+    : 0;
+  const seedParam = searchParams.get('seed');
+  const hashSeed = seedParam === null
+    ? 0
+    : (seedParam === 'demo' ? DEMO_SEED : Number(seedParam) >>> 0);
+
   function stepOnce() {
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbos[write]);
     gl.viewport(0, 0, size, size);
@@ -226,7 +268,8 @@ async function main() {
     gl.uniform1i(simLoc.uSize, size);
     gl.uniform1i(simLoc.uWrap, 1);
     gl.uniform1i(simLoc.uGen, generation);
-    gl.uniform1ui(simLoc.uSeed, HASH_SEED);
+    gl.uniform1ui(simLoc.uSeed, hashSeed);
+    gl.uniform1i(simLoc.uMutBp, mutBp);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     read = write;
     write ^= 1;
@@ -331,8 +374,6 @@ async function main() {
     uploadPatch(0, 0, size, size, fullBuf);
   }
 
-  const DEMO_SEED = 0x2F6E2B1;
-
   function seededFill(seed) {
     const rnd = mulberry32(seed >>> 0);
     const n = size * size;
@@ -346,9 +387,8 @@ async function main() {
   }
 
   function initSeed() {
-    const param = new URLSearchParams(location.search).get('seed');
-    if (param === null) return;
-    seededFill(param === 'demo' ? DEMO_SEED : Number(param) >>> 0);
+    if (seedParam === null) return;
+    seededFill(hashSeed);
   }
 
   function applyGridSize(newSize) {
@@ -365,6 +405,8 @@ async function main() {
     write = 1;
     generation = 0;
     fullBuf = new Uint8Array(size * size * 4);
+    countBuf = new Uint8Array(size * size * 4);
+    lineageCount = 1;
     window.__life.size = size;
     fitView();
   }
@@ -585,11 +627,14 @@ async function main() {
     }
     hudFrames++;
     if (hudLastTime < 0) hudLastTime = now;
-    if (now - hudLastTime >= 1000) {
+    const hudDue = now - hudLastTime >= 1000;
+    if (hudDue) {
       const hudDt = (now - hudLastTime) / 1000;
       const fps = Math.round(hudFrames / hudDt);
       const genRate = Math.round((generation - hudLastGen) / hudDt);
-      elHud.textContent = fps + ' fps | ' + genRate + ' gen/s | gen ' + generation;
+      if (!auto) countLineages();
+      elHud.textContent = fps + ' fps | ' + genRate + ' gen/s | gen ' + generation
+        + ' | lineages: ' + lineageCount;
       hudFrames = 0;
       hudLastGen = generation;
       hudLastTime = now;

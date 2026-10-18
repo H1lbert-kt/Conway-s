@@ -145,6 +145,74 @@ function cpuStepGenome(state, size, gen, seed) {
   return next;
 }
 
+// Stage 8: CPU reference with mutation + full 24-bit lineage inheritance
+// (mirror of sim.frag; mutBp = ?mut= in basis points, 0 = stage-7 behavior).
+function cpuStepGenomeMut(state, size, gen, seed, mutBp) {
+  const next = new Uint8Array(size * size * 4);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      let n = 0;
+      const living = [];
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          if (dx === 0 && dy === 0) continue;
+          const qx = (x + dx + size) % size;
+          const qy = (y + dy + size) % size;
+          const i = (qy * size + qx) * 4;
+          if (state[i] & 1) {
+            n++;
+            living.push((state[i + 1] | (state[i + 2] << 8) | (state[i + 3] << 16)) >>> 0);
+          }
+        }
+      }
+      const si = (y * size + x) * 4;
+      const r = state[si];
+      const g = state[si + 1];
+      const b = state[si + 2];
+      const a = state[si + 3];
+      const selfAlive = (r & 1) === 1;
+      let alive;
+      if (n === 8) {
+        alive = selfAlive ? ((a & 2) !== 0) : ((a & 1) !== 0);
+      } else {
+        alive = selfAlive ? (((b >> n) & 1) !== 0) : (((g >> n) & 1) !== 0);
+      }
+      let outR = 0;
+      let outG = g;
+      let outB = b;
+      let outA = a;
+      if (alive) {
+        let age = r >> 1;
+        if (age < 127) age += 1;
+        outR = (age << 1) | 1;
+        if (!selfAlive) {
+          const h = hashCell(x, y, gen, seed);
+          let genome = living.length > 0
+            ? living[h % living.length]
+            : (g | (b << 8) | (a << 16)) >>> 0;
+          if (mutBp > 0 && (h % 10000) < mutBp) {
+            const bit = Math.floor(h / 10000) % 18;
+            genome = (genome ^ (1 << bit)) >>> 0;
+            const lid = 1 + ((h >>> 9) % 63);
+            outG = genome & 0xFF;
+            outB = (genome >>> 8) & 0xFF;
+            outA = ((genome >>> 16) & 0x03) | (lid << 2);
+          } else {
+            outG = genome & 0xFF;
+            outB = (genome >>> 8) & 0xFF;
+            outA = (genome >>> 16) & 0xFF;
+          }
+        }
+      }
+      next[si] = outR;
+      next[si + 1] = outG;
+      next[si + 2] = outB;
+      next[si + 3] = outA;
+    }
+  }
+  return next;
+}
+
 function toRgba(grid) {
   const buf = new Uint8Array(grid.length * 4);
   for (let i = 0; i < grid.length; i++) {
@@ -1031,6 +1099,173 @@ async function main() {
       mixedMismatch
         ? `${mixedMismatch} byte mismatches, first @${firstBad}: cpu=[${mixedCpu.slice(firstBad, firstBad + 4)}] gpu=[${mixedGpu.slice(firstBad, firstBad + 4)}]`
         : 'bit-exact over 50 gens');
+  }
+
+  // ---- Stage 8: mutation, lineages, lineage color, HUD count ----
+  {
+    const hsl2rgbRef = (lid) => {
+      const h = ((lid * 0.6180339887) % 1) * 360;
+      const s = 0.65;
+      const l = 0.55;
+      const c = (1 - Math.abs(2 * l - 1)) * s;
+      const hp = h / 60;
+      const x = c * (1 - Math.abs((hp % 2) - 1));
+      let rgb;
+      if (hp < 1) rgb = [c, x, 0];
+      else if (hp < 2) rgb = [x, c, 0];
+      else if (hp < 3) rgb = [0, c, x];
+      else if (hp < 4) rgb = [0, x, c];
+      else if (hp < 5) rgb = [x, 0, c];
+      else rgb = [c, 0, x];
+      const m = l - c * 0.5;
+      return rgb.map((v) => Math.round((v + m) * 255));
+    };
+    const near8 = (got, want) => Math.abs(got[0] - want[0]) <= 8 && Math.abs(got[1] - want[1]) <= 8 && Math.abs(got[2] - want[2]) <= 8;
+    const stampMixed = () => page.evaluate(() => {
+      window.__life.setAuto(false);
+      window.__life.setGenome('conway');
+      window.__life.clear();
+      for (let y = 0; y < 64; y++) {
+        for (let x = 0; x < 64; x++) {
+          const left = x < 32;
+          const alive = left ? ((x * 3 + y * 5) % 7 < 3) : ((x * 5 + y * 3) % 11 < 4);
+          if (alive) {
+            window.__life.setGenome(left ? 'conway' : 'highlife');
+            window.__life.stampBrush(x, y, 0);
+          }
+        }
+      }
+      window.__life.setGenome('conway');
+    });
+    const readRaw64 = () => page.evaluate(() => Array.from(window.__life.readRaw(0, 0, 64, 64)));
+    const countIds = (buf) => {
+      const seen = new Set();
+      for (let i = 0; i < buf.length; i += 4) {
+        if (buf[i] & 1) seen.add(buf[i + 3] >> 2);
+      }
+      return seen;
+    };
+
+    // mut absent: rule stays stage-7 bit-exact (vs the stage-7 CPU ref chain)
+    // and every lineage id stays 0.
+    await page.goto(`${base}?size=${SIZE}&sps=0.0001`);
+    await page.waitForFunction(() => !!window.__life || !!document.getElementById('error'));
+    await stampMixed();
+    const m0s0 = Uint8Array.from(await readRaw64());
+    const m0gen = await page.evaluate(() => window.__life.generation());
+    await page.evaluate(() => window.__life.step(30));
+    const m0gpu = Uint8Array.from(await readRaw64());
+    let m0cpu = m0s0;
+    for (let g = 0; g < 30; g++) m0cpu = cpuStepGenomeMut(m0cpu, 64, m0gen + g, 0, 0);
+    let m0Mismatch = 0;
+    for (let i = 0; i < m0cpu.length; i++) if (m0cpu[i] !== m0gpu[i]) m0Mismatch++;
+    const m0Ids = countIds(m0gpu);
+    record('stage8: mut absent/0 keeps stage-7 bit-exact and all lineage ids 0',
+      m0Mismatch === 0 && [...m0Ids].every((id) => id === 0),
+      `mismatches=${m0Mismatch} ids=${[...m0Ids].join('/')}`);
+
+    // HUD on a pure Conway world (paused): lineages: 1.
+    await page.evaluate(() => {
+      window.__life.setGenome('conway');
+      window.__life.clear();
+      window.__life.stampPattern('blinker', 20, 30);
+      window.__life.setAuto(false);
+    });
+    await page.waitForTimeout(1500);
+    const hudPure = await page.evaluate(() => document.getElementById('hud').textContent);
+    const hudPureN = /lineages: (\d+)/.exec(hudPure);
+    record('stage8: HUD shows lineages count (pure Conway world = 1)',
+      !!hudPureN && Number(hudPureN[1]) === 1, `hud="${hudPure}"`);
+
+    // mut=0.15: births mutate — lineage ids appear in A bits2-7; GPU matches
+    // the mutation+lineage CPU ref bit-exactly for 50 gens; paused HUD counts
+    // the distinct living lineages (>= 2 after mutations).
+    await page.goto(`${base}?size=${SIZE}&sps=0.0001&mut=0.15`);
+    await page.waitForFunction(() => !!window.__life || !!document.getElementById('error'));
+    await stampMixed();
+    const m1s0 = Uint8Array.from(await readRaw64());
+    const m1gen = await page.evaluate(() => window.__life.generation());
+    await page.evaluate(() => window.__life.step(5));
+    const m1early = Uint8Array.from(await readRaw64());
+
+    // Color probe while the page is still at the snapshot generation (later
+    // gens extinguish lid0 and move the cells): a lineage-0 alive cell keeps
+    // the classic color; a mutated cell matches the golden-angle HSL ref.
+    // Camera-constrained search — only cells inside the fitted view are probed.
+    const v8 = await page.evaluate(() => window.__life.view());
+    const yMin = Math.max(0, Math.ceil(v8[1]));
+    const yMax = Math.min(63, Math.floor(v8[1] + v8[3]));
+    const xMin = Math.max(0, Math.ceil(v8[0]));
+    const xMax = Math.min(63, Math.floor(v8[0] + v8[2]));
+    let cell0 = -1;
+    let cellMut = -1;
+    for (let y = yMin; y <= yMax; y++) {
+      for (let x = xMin; x <= xMax; x++) {
+        const i = (y * 64 + x) * 4;
+        if (!(m1early[i] & 1)) continue;
+        const lid = m1early[i + 3] >> 2;
+        if (lid === 0 && cell0 < 0) cell0 = y * 64 + x;
+        if (lid !== 0 && cellMut < 0) cellMut = y * 64 + x;
+      }
+    }
+    const screenAt = (wx, wy) => page.evaluate(([wx, wy]) => {
+      const L = window.__life;
+      const c = document.querySelector('canvas');
+      const v = L.view();
+      const px = Math.floor((wx - v[0]) / v[2] * c.width);
+      const py = Math.floor((wy - v[1]) / v[3] * c.height);
+      const b = L.readScreen(px, py, 1, 1);
+      return [b[0], b[1], b[2]];
+    }, [wx, wy]);
+    if (cell0 >= 0 && cellMut >= 0) {
+      const px0 = await screenAt((cell0 % 64) + 0.5, Math.floor(cell0 / 64) + 0.5);
+      const lidMut = m1early[cellMut * 4 + 3] >> 2;
+      const pxMut = await screenAt((cellMut % 64) + 0.5, Math.floor(cellMut / 64) + 0.5);
+      const refMut = hsl2rgbRef(lidMut);
+      record('stage8: lineage 0 keeps classic color; mutated lineage matches HSL ref',
+        near8(px0, [235, 240, 255]) && near8(pxMut, refMut) && !near8(pxMut, [235, 240, 255]),
+        `lid0=${px0} lid${lidMut}=${pxMut} ref=${refMut}`);
+    } else {
+      record('stage8: lineage 0 keeps classic color; mutated lineage matches HSL ref',
+        false, `cells not found: lid0=${cell0} mut=${cellMut}`);
+    }
+
+    await page.evaluate(() => window.__life.step(45));
+    const m1gpu = Uint8Array.from(await readRaw64());
+    let m1cpu = m1s0;
+    for (let g = 0; g < 50; g++) m1cpu = cpuStepGenomeMut(m1cpu, 64, m1gen + g, 0, 1500);
+    let m1Mismatch = 0;
+    for (let i = 0; i < m1cpu.length; i++) if (m1cpu[i] !== m1gpu[i]) m1Mismatch++;
+    const m1Ids = countIds(m1gpu);
+    await page.waitForTimeout(1500);
+    const hudMut = await page.evaluate(() => document.getElementById('hud').textContent);
+    const hudMutN = /lineages: (\d+)/.exec(hudMut);
+    record('stage8: mut>0 produces lineage ids; GPU matches CPU ref for 50 gens',
+      m1Mismatch === 0 && m1Ids.size >= 2 && !!hudMutN && Number(hudMutN[1]) >= 2,
+      `mismatches=${m1Mismatch} distinctIds=${m1Ids.size} hud="${hudMut}"`);
+
+    // Determinism: same ?seed=+?mut= twice -> identical grids; different mut
+    // diverges. Initial fill + hash both come from ?seed=.
+    const loadMut = async (query) => {
+      const p = await browser.newPage({ viewport: { width: 220, height: 160 } });
+      await p.goto(`${base}?size=64&sps=0.0001&${query}`);
+      await p.waitForFunction(() => !!window.__life);
+      await p.evaluate(() => window.__life.setAuto(false));
+      await p.evaluate(() => window.__life.step(15));
+      const grid = Uint8Array.from(await p.evaluate(() => Array.from(window.__life.readRaw(0, 0, 64, 64))));
+      await p.close();
+      return grid;
+    };
+    const eqBuf = (x, y) => {
+      for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+      return true;
+    };
+    const detA = await loadMut('seed=7&mut=0.1');
+    const detB = await loadMut('seed=7&mut=0.1');
+    const detC = await loadMut('seed=7&mut=0.2');
+    record('stage8: ?seed=+?mut= deterministic across loads; different mut diverges',
+      eqBuf(detA, detB) && !eqBuf(detA, detC),
+      `A==B ${eqBuf(detA, detB)}, A!=C ${!eqBuf(detA, detC)}`);
   }
 
   // ---- Loop hygiene with auto stepping on (second page) ----
