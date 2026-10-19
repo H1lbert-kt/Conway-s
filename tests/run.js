@@ -5,6 +5,8 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
+const { execFileSync, spawnSync } = require('child_process');
 const { chromium } = require('playwright-core');
 
 const SIZE = 64;
@@ -1290,6 +1292,90 @@ async function main() {
     record('loop: no GPU readback while running', c.readPixels === 0, `readPixels=${c.readPixels}`);
     record('loop: no extra allocations while running', c.textures === 2 && c.framebuffers === 2, JSON.stringify(c));
     await page2.close();
+  }
+
+  // ---- Stage 9: novelty explorer (unit + determinism + smoke) ----
+  {
+    const explore = require(path.join(ROOT, 'tools', 'explore.js'));
+    const ffmpegHere = spawnSync('ffmpeg', ['-version'], { stdio: 'ignore' }).status === 0;
+
+    // Unit: boring filters classify die / freeze / noise correctly.
+    const frozenM = {
+      vec: {
+        activityMean: 0.01, activityStd: 0, spatialEntropy: 0.2, compressibility: 0.1,
+        movingComponents: 0, persistence: 1, lineageDiversity: 0, stability: 1,
+      },
+      finalPop: 100, maxPop: 100,
+    };
+    const diedM = { vec: frozenM.vec, finalPop: 0, maxPop: 100 };
+    const noiseM = {
+      vec: { ...frozenM.vec, activityMean: 0.5, compressibility: 0.8, stability: 0.1 },
+      finalPop: 2000, maxPop: 3000,
+    };
+    const interestingM = {
+      vec: {
+        activityMean: 0.2, activityStd: 0.1, spatialEntropy: 0.6, compressibility: 0.3,
+        movingComponents: 0.2, persistence: 0.7, lineageDiversity: 0.1, stability: 0.5,
+      },
+      finalPop: 1000, maxPop: 2000,
+    };
+    record('stage9: boring filters (dies/frozen/noise) classify correctly',
+      explore.isBoring(diedM).died === true
+      && explore.isBoring(frozenM).frozen === true
+      && explore.isBoring(noiseM).noise === true
+      && explore.isBoring(interestingM).any === false,
+      `died=${JSON.stringify(explore.isBoring(diedM).died)} frozen=${JSON.stringify(explore.isBoring(frozenM).frozen)} noise=${JSON.stringify(explore.isBoring(noiseM).noise)}`);
+
+    // Unit: novelty distance is Euclidean over the fixed metric vector.
+    const zeroVec = {};
+    for (const k of explore.METRIC_KEYS) zeroVec[k] = 0;
+    const oneVec = { ...zeroVec };
+    oneVec.activityMean = 1;
+    record('stage9: novelty distance is Euclidean in metric space',
+      explore.noveltyDistance(zeroVec, zeroVec) === 0
+      && Math.abs(explore.noveltyDistance(zeroVec, oneVec) - 1) < 1e-12
+      && explore.noveltyDistance(zeroVec, oneVec) >= explore.TAU_DEFAULT,
+      `d=${explore.noveltyDistance(zeroVec, oneVec).toFixed(3)} tau=${explore.TAU_DEFAULT}`);
+
+    // Determinism + smoke in isolated tmp dirs (the real archive is never read
+    // or written by tests). --pattern still => deterministic frozen world;
+    // --force-keep exercises the full gallery pipeline on it.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'explore-'));
+    const runExplorer = (out) => execFileSync('node', [
+      path.join(ROOT, 'tools', 'explore.js'),
+      '--size', '64', '--gens', '20', '--worlds', '1', '--seed-base', '7',
+      '--pattern', 'still', '--force-keep',
+      '--archive', path.join(out, 'archive.json'),
+      '--out', out,
+    ], { cwd: ROOT, stdio: 'pipe' });
+    const detA = path.join(tmp, 'a');
+    const detB = path.join(tmp, 'b');
+    fs.mkdirSync(detA);
+    fs.mkdirSync(detB);
+    runExplorer(detA);
+    runExplorer(detB);
+    const read = (p) => fs.readFileSync(p, 'utf8');
+    record('stage9: same config -> byte-identical run.json + archive.json',
+      read(path.join(detA, 'run.json')) === read(path.join(detB, 'run.json'))
+      && read(path.join(detA, 'archive.json')) === read(path.join(detB, 'archive.json')),
+      'run.json + archive.json');
+
+    const runJ = JSON.parse(read(path.join(detA, 'run.json')));
+    const w0 = runJ.worlds[0];
+    const entryDir = path.join(detA, w0.entry);
+    const entry = JSON.parse(read(path.join(entryDir, 'metrics.json')));
+    const gifOk = ffmpegHere
+      ? fs.existsSync(path.join(entryDir, 'anim.gif')) && fs.statSync(path.join(entryDir, 'anim.gif')).size > 0
+      : entry.gifSkip === 'ffmpeg not found';
+    record('stage9: smoke — archive written, still world frozen, gallery entry complete',
+      fs.existsSync(path.join(detA, 'archive.json'))
+      && w0.boring.frozen === true
+      && w0.kept === true
+      && /^index\.html\?size=64&seed=7&mut=0(\.\d+)?$/.test(entry.reproUrl)
+      && explore.METRIC_KEYS.every((k) => typeof entry.metrics[k] === 'number')
+      && gifOk,
+      `reproUrl=${entry.reproUrl} gif=${entry.gif} gifSkip=${entry.gifSkip}`);
+    fs.rmSync(tmp, { recursive: true, force: true });
   }
 
   record(

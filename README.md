@@ -50,7 +50,7 @@ pnpm install   # só playwright-core, dev-dependency do harness
 pnpm test
 ```
 
-O harness (`tests/run.js`, Playwright + Chromium headless) roda **61 verificações** (os 49 testes originais, intocados, + 3 da Stage 6, + 4 da Stage 7, + 5 da Stage 8) e imprime PASS/FAIL por critério, com exit code ≠ 0 em falha. Ele valida:
+O harness (`tests/run.js`, Playwright + Chromium headless) roda **65 verificações** (os 49 testes originais, intocados, + 3 da Stage 6, + 4 da Stage 7, + 5 da Stage 8, + 4 da Stage 9) e imprime PASS/FAIL por critério, com exit code ≠ 0 em falha. Ele valida:
 
 - **Fidelidade bit-a-bit contra uma referência CPU da B3/S23**: blinker, block, glider (interior e **atravessando a costura do toro**), e Gosper gun por 60 gerações.
 - **Golden do Gosper gun** (valores canônicos, não só CPU-vs-GPU): população **36/41/46** nas gerações 0/30/60 em grid 128², e os offsets exatos dos gliders emitidos (fixados no teste, derivados da referência CPU e conferidos contra as populações canônicas).
@@ -62,6 +62,7 @@ O harness (`tests/run.js`, Playwright + Chromium headless) roda **61 verificaç�
 - **Byte layout (Stage 6):** células morta/viva com máscaras Conway gravadas, idade que sobe 1 por geração e satura em 127, morte zerando a idade e mantendo as máscaras (via `readRaw`).
 - **Genoma por célula (Stage 7):** stamping com os presets Conway/HighLife afirmado via `readRaw`, nascimento herdando o genoma do vizinho escolhido pelo hash, n==8 indexando os bits do canal A, e grid misto Conway/HighLife bit-exato (uvec4) contra a referência CPU por 50 gerações — a prova de paridade do hash JS/GLSL (qualquer divergência diverge rápido).
 - **Mutação e linhagens (Stage 8):** `mut=0`/ausente mantém o comportamento Stage 7 bit-exato e todos os ids de linhagem em 0; `mut=0.15` produz ids distintos em A bits2–7 com o grid GPU bit-exato (uvec4) contra a referência CPU com mutação por 50 gerações; cor: linhagem 0 mantém o branco-clássico e célula mutada bate (±8) com a referência HSL computada no teste para o id dela; HUD pausado conta as linhagens vivas (mundo Conway puro = 1, após mutações ≥ 2); e determinismo: duas loads com o mesmo `?seed=`+`?mut=` evoluem idênticas, com `?mut=` diferente divergem.
+- **Explorador de novidade (Stage 9):** unitários dos filtros boring (morre/congelou/ruído) e da distância de novelty; determinismo byte-a-byte de `run.json`+`archive.json` entre duas execuções do explorador (mundos still-life em dirs temporários, o archive real nunca é tocado); smoke: still filtrado como frozen, entrada de galeria completa (`reproUrl` no formato certo, métricas numéricas, GIF presente quando ffmpeg existe / `gifSkip` explícito quando não).
 
 O `readPixels` acontece **exclusivamente fora do stepping automático**: no caminho de validação/teste e no tick de 1 Hz do HUD **somente com a simulação pausada** — nunca em handlers de input nem durante o stepping (comprovado pelo teste de higiene: 0 `readPixels` durante a medição com auto-stepping ligado).
 
@@ -121,6 +122,24 @@ Referência da Stage 5 (antes do byte layout, sob carga alta): display ~27 fps e
 - A próxima geração é **consumida do texel `read`** no passo seguinte — pinturas caem estritamente entre passos (single-threaded).
 - Hooks de validação: `__life.read()` devolve canal 0 como 0/255 (contrato do harness); `__life.readRaw()` devolve os bytes brutos do layout — só fora do loop.
 
+## Explorador de novidade (Stage 9)
+
+`tools/explore.js` (Node + playwright-core, self-contained — servidor/launch copiados do padrão do harness, `tests/run.js` intocado) roda uma matriz de mundos headless e guarda só o que é interessante:
+
+```
+node tools/explore.js --size 64 --gens 120 --worlds 8 --seed-base 1 --mut 0.05
+```
+
+Flags: `--size`, `--gens`, `--worlds` (K seeds a partir de `--seed-base`), `--mut`, `--genome conway|highlife`, `--tau` (limiar de novelty, padrão 0.35), `--archive` (padrão `tools/gallery/archive.json`), `--out` (padrão `tools/gallery/`), `--pattern soup|still`, `--no-gif`, `--force-keep` (debug/teste: mantém até os chatos). Cada mundo é aberto em `?size=&seed=&mut=` com auto desligado e avançado em lotes via `__life.step(k)` — nenhum readback dentro do rAF (caminho de validação; a higiene do loop continua verde).
+
+**Métricas** (vetor fixo em [0,1], ordem fixa no archive): `activityMean`/`activityStd` (série da fração viva por snapshot), `spatialEntropy` (Shannon do histograma de vizinhos vivos, normalizada por log2 9), `compressibility` (razão zlib do bit-pack vivo; ≈1 = ruído), `movingComponents` (componentes 8-conectados cujo centroide move >1 célula entre snapshots, /16), `persistence` (pop final / pop máx), `lineageDiversity` (ids distintos / 64, stage 8), `stability` (fração de células inalteradas entre os dois últimos snapshots).
+
+**Filtros boring** (limiares fixos no topo do arquivo, documentados): morre = pop final 0; congela = `stability ≥ 0.9999` (still life); ruído = `activityMean > 0.35` **e** `compressibility > 0.55` **e** `stability < 0.3`. Osciladores não são boring. **Novelty**: distância euclidiana no vetor normalizado; mantém se `min distância ao arquivo ≥ τ` (τ via `--tau`). O archive é **gitignorado** (local; curadoria versionada fica para decisão futura).
+
+**Saída**: `run.json` (métricas de todos os mundos — determinístico, sem timestamps) + `archive.json` atualizado; por mundo mantido, `tools/gallery/<id>/` com `metrics.json` (params + `reproUrl` = `index.html?size=&seed=&mut=` + métricas) e `anim.gif` curto (~20 frames stepped via `readScreen` 256² → pipe `rawvideo` → ffmpeg `palettegen/paletteuse`; sem ffmpeg no PATH, `gifSkip: "ffmpeg not found"` — nunca falha). Mesma config ⇒ mesmas métricas byte-a-byte (mesmo stack gráfico) — afirmado por teste no `pnpm test`.
+
+**Throughput medido** (SwiftShader, mesma máquina das medições acima): ~46 mundos/min a 64² com 60 gerações e GIF ligado — 100 mundos ≈ 2,2 min. `--no-gif` e grids menores aumentam bastante; a matriz real é uma questão de paciência, não de infra.
+
 ## Como foi desenvolvido
 
 Este repositório é também um experimento de **orquestração por agente** — o desenvolvimento foi conduzido com o opencode e duas comandos customizadas, com a issue do GitHub como única fonte da verdade de cada etapa:
@@ -159,8 +178,8 @@ Labels: `stage` (toda issue de etapa), `planned` (planejada/em implementação),
 | 5 — Validação e performance em escala | #5 | fechada |
 | 6 — Formato RGBA8UI + modo Conway equivalente | #6 | fechada |
 | 7 — Genoma por célula + herança determinística | #7 | fechada |
-| 8 — Mutação + linhagens + cor | #8 | esta |
-| 9 — Explorador de novidade (novelty search) | #9 | aberta |
+| 8 — Mutação + linhagens + cor | #8 | fechada |
+| 9 — Explorador de novidade (novelty search) | #9 | esta |
 | 10 — Ecologia — seleção, energia, nicho, idade | #10 | aberta |
 | 11 — Experimentos de regras pouco exploradas | #11 | aberta |
 
@@ -171,9 +190,11 @@ Veja [AGENTS.md](./AGENTS.md) — stack fixa (HTML + JS + WebGL2, sem framework/
 ## Estrutura
 
 ```
-index.html      página + toolbar + HUD (sem framework)
-main.js         app WebGL2: context, sim pass, display pass, uploads, controles
-shaders/        sim.vert / sim.frag (B3/S23) / display.frag
-tests/run.js    harness headless (pnpm test)
-assets/         screenshot + gif usados neste README
+index.html        página + toolbar + HUD (sem framework)
+main.js           app WebGL2: context, sim pass, display pass, uploads, controles
+shaders/          sim.vert / sim.frag (genoma + mutação/linhagem) / display.frag
+tools/explore.js  explorador de novidade headless (stage 9)
+tools/gallery/    saída do explorador (gitignorado: run.json, archive.json, achados)
+tests/run.js      harness headless (pnpm test)
+assets/           screenshot + gif usados neste README
 ```
