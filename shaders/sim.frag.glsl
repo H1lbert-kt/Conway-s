@@ -55,15 +55,15 @@ const int FREQ_SIM_DIST = 4;
 const int FREQ_PENALTY_T = 4;
 #endif
 #if ENERGY == 1
-const int ENERGY_B_MIN = 8;
+const int ENERGY_B_MIN = 4;
 #endif
 #if NICHE == 1
-const int NICH_T = 8;
+const int NICH_T = 48;
 #endif
 #if AGE == 1
-const int AGE_Y_MIN = 4;
-const int AGE_DEATH_START = 32;
-const int AGE_DEATH_STEP_BP = 800;
+const int AGE_Y_MIN = 1;
+const int AGE_DEATH_START = 96;
+const int AGE_DEATH_STEP_BP = 200;
 #endif
 
 int byteOf(float f) { return int(f * 255.0 + 0.5); }

@@ -188,6 +188,8 @@ async function main() {
     uMainOld: gl.getUniformLocation(ecoProgram, 'uMainOld'),
     uMainNew: gl.getUniformLocation(ecoProgram, 'uMainNew'),
     uEco: gl.getUniformLocation(ecoProgram, 'uEco'),
+    uSize: gl.getUniformLocation(ecoProgram, 'uSize'),
+    uWrap: gl.getUniformLocation(ecoProgram, 'uWrap'),
   };
   const displayLoc = {
     uState: gl.getUniformLocation(displayProgram, 'uState'),
@@ -310,14 +312,17 @@ async function main() {
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, size, size, gl.RGBA, gl.UNSIGNED_BYTE, buf);
   }
 
-  // Stage 10: ecoBuf[i] = alive ? E0 : 0 from a CPU-side alive bitmap (never
-  // GPU readback — stage-8 lesson: readPixels mid-session drains the queue).
+  // Stage 10: ecoBuf from a CPU-side alive bitmap (never GPU readback —
+  // stage-8 lesson: readPixels mid-session drains the queue). Ambient pool:
+  // every location starts with ENERGY_E0 (alive stores it in R, dead in G),
+  // so virgin space can host births — total = E0 * size^2, conserved.
   function fillEcoBuf(aliveAt) {
     if (!ecoOn) return;
     const n = size * size;
     for (let i = 0; i < n; i++) {
-      ecoBuf[i * 4] = aliveAt(i) ? ENERGY_E0 : 0;
-      ecoBuf[i * 4 + 1] = 0;
+      const alive = aliveAt(i);
+      ecoBuf[i * 4] = alive ? ENERGY_E0 : 0;
+      ecoBuf[i * 4 + 1] = alive ? 0 : ENERGY_E0;
       ecoBuf[i * 4 + 2] = 0;
       ecoBuf[i * 4 + 3] = 0;
     }
@@ -356,6 +361,8 @@ async function main() {
       gl.activeTexture(gl.TEXTURE2);
       gl.bindTexture(gl.TEXTURE_2D, ecoTextures[ecoRead]);
       gl.uniform1i(ecoLoc.uEco, 2);
+      gl.uniform1i(ecoLoc.uSize, size);
+      gl.uniform1i(ecoLoc.uWrap, 1);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
       const er = ecoRead;
       ecoRead = ecoWrite;
@@ -663,12 +670,13 @@ async function main() {
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
       gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, data);
       if (ecoOn) {
-        // Eco re-init from the CPU-side alive bits (no GPU readback).
+        // Eco re-init from the CPU-side alive bits (no GPU readback); same
+        // ambient-pool init as fillEcoBuf (alive: R=E0, dead: G=E0).
         const m = size * size;
         for (let i = 0; i < m; i++) {
           const alive = i < n ? (data[i * 4] & 1) : 0;
           ecoBuf[i * 4] = alive ? ENERGY_E0 : 0;
-          ecoBuf[i * 4 + 1] = 0;
+          ecoBuf[i * 4 + 1] = alive ? 0 : ENERGY_E0;
           ecoBuf[i * 4 + 2] = 0;
           ecoBuf[i * 4 + 3] = 0;
         }

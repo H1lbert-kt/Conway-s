@@ -220,11 +220,13 @@ const ECO = {
   FREQ_SIM_DIST: 4,
   FREQ_PENALTY_T: 4,
   ENERGY_E0: 8,
-  ENERGY_B_MIN: 8,
-  NICH_T: 8,
-  AGE_Y_MIN: 4,
-  AGE_DEATH_START: 32,
-  AGE_DEATH_STEP_BP: 800,
+  ENERGY_B_MIN: 4,
+  NICH_T: 48,
+  GIVE_T: 8,
+  RCV_T: 4,
+  AGE_Y_MIN: 1,
+  AGE_DEATH_START: 96,
+  AGE_DEATH_STEP_BP: 200,
 };
 
 function popcount18(v) {
@@ -239,8 +241,9 @@ function popcount18(v) {
 
 // Stage 10: CPU reference for the ecology flags — sim pass mirrors sim.frag
 // (freq/age/niche/energy branches + mutation), eco pass mirrors eco.frag
-// (births/deaths diffed from old/new main, pool split/merge; niche B is a
-// monotone death scar: +1 on death, no birth write — see eco.frag header).
+// (births/deaths diffed from old/new main, pool split/merge, spatial flow
+// GIVE_T->RCV_T rich->poor flow on pre-event values; niche B is a monotone
+// +1 on death, no birth write — see eco.frag header).
 // opts = { freq, energy, niche, age, mutBp }; returns { state, eco }.
 function cpuStepEco(state, eco, size, gen, seed, opts) {
   const freq = opts.freq ? 1 : 0;
@@ -351,11 +354,15 @@ function cpuStepEco(state, eco, size, gen, seed, opts) {
   const nextEco = new Uint8Array(size * size * 4);
   for (let i = 0; i < size * size; i++) {
     const si = i * 4;
+    const x = i % size;
+    const y = (i / size) | 0;
     const oldAlive = state[si] & 1;
     const newAlive = next[si] & 1;
     let er = eco[si];
     let eg = eco[si + 1];
     let eb = eco[si + 2];
+    const gPre = eco[si + 1];
+    const bornSelf = !oldAlive && newAlive;
     if (!oldAlive && newAlive) {
       const part = eg >> 1;
       er = part;
@@ -365,6 +372,32 @@ function cpuStepEco(state, eco, size, gen, seed, opts) {
       er = 0;
       eb = eb < 255 ? eb + 1 : eb;
     }
+    // Spatial flow (mirrors eco.frag): pre-event self/neighbor pools; a
+    // non-birthing rich texel (>= GIVE_T) gives 1 to each poor neighbor
+    // (< RCV_T), a poor texel takes 1 from each non-birthing rich neighbor.
+    // Pair-symmetric => exact.
+    let flow = 0;
+    if (!bornSelf && gPre >= ECO.GIVE_T) {
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          if (dx === 0 && dy === 0) continue;
+          const qi = (((y + dy + size) % size) * size + ((x + dx + size) % size)) * 4;
+          if (eco[qi + 1] < ECO.RCV_T) flow -= 1;
+        }
+      }
+    } else if (gPre < ECO.RCV_T) {
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          if (dx === 0 && dy === 0) continue;
+          const qi = (((y + dy + size) % size) * size + ((x + dx + size) % size)) * 4;
+          if (eco[qi + 1] >= ECO.GIVE_T) {
+            const qBorn = !(state[qi] & 1) && (next[qi] & 1);
+            if (!qBorn) flow += 1;
+          }
+        }
+      }
+    }
+    eg = eg + flow;
     nextEco[si] = er;
     nextEco[si + 1] = eg;
     nextEco[si + 2] = eb;
@@ -1615,9 +1648,30 @@ async function main() {
         }
         if (g === gens) break;
         await page.evaluate(() => window.__life.step(1));
+        const prevS = s, prevE = e;
         const r = cpuStepEco(s, e, 64, gen0 + g, hashSeed, refOpts);
         s = r.state;
         e = r.eco;
+        if (process.env.ECO_DEBUG && hasEcoTex) {
+          const eGpuNow = await readEco64();
+          let bad = -1;
+          for (let i = 0; i < e.length; i++) if (e[i] !== eGpuNow[i]) { bad = i; break; }
+          if (bad >= 0) {
+            const ti = (bad / 4) | 0, ch = bad % 4;
+            const x = ti % 64, y = (ti / 64) | 0;
+            const ring = [];
+            for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+              if (!dx && !dy) continue;
+              const qi = (((y + dy + 64) % 64) * 64 + ((x + dx + 64) % 64)) * 4;
+              const nBorn = !(prevS[qi] & 1) && (s[qi] & 1);
+              ring.push(`(${dx},${dy}) gpre=${prevE[qi + 1]} st=${prevS[qi] & 1}->${s[qi] & 1}${nBorn ? ' BORN' : ''}`);
+            }
+            console.log(`ECO_DEBUG first diverge gen=${gen0 + g + 1} texel=(${x},${y}) ch=${ch} cpu=${e[bad]} gpu=${eGpuNow[bad]}`);
+            console.log(`ECO_DEBUG self: gpre=${prevE[ti * 4 + 1]} er=${prevE[ti * 4]} st=${prevS[ti * 4] & 1}->${s[ti * 4] & 1} cpuOut r/g/b=${e[ti * 4]}/${e[ti * 4 + 1]}/${e[ti * 4 + 2]} gpuOut=${eGpuNow[ti * 4]}/${eGpuNow[ti * 4 + 1]}/${eGpuNow[ti * 4 + 2]}`);
+            console.log('ECO_DEBUG ring(old->new): ' + ring.join(' | '));
+            break;
+          }
+        }
       }
       const sGpu = Uint8Array.from(await readRaw64());
       if (!eqBuf(s, sGpu)) diverged = true;
@@ -1652,36 +1706,30 @@ async function main() {
     }
 
     // energy=1: GPU matches the CPU ref for 30 gens; total energy sum(R)+sum(G)
-    // is invariant every generation (= 8 * initial population) and the gate
-    // (pool < 8 vetoes births) changes dynamics vs baseline.
+    // is invariant every generation (= E0 per location, ambient-pool init) and
+    // the gate (pool < B_MIN vetoes births) changes dynamics vs baseline.
     {
       const r = await stepAndCompareEco({ flags: { energy: '1' }, mut: 0.15, seed: 7, seedOnly: true }, 30);
       const conserved = r.sums.every((v) => v === r.sums[0]);
-      const pop0 = (await (async () => {
-        await page.goto(`${base}?size=64&sps=0.0001&seed=7`);
-        await page.waitForFunction(() => !!window.__life);
-        const raw = Uint8Array.from(await readRaw64());
-        let p = 0;
-        for (let i = 0; i < raw.length; i += 4) if (raw[i] & 1) p++;
-        return p;
-      })());
       const energy0 = conserved ? r.sums[0] : -1;
+      const expected0 = ECO.ENERGY_E0 * 64 * 64; // ambient pool: E0 per location
       const flag30 = await loadGrid('seed=7&mut=0.15&energy=1');
       const base30 = await loadGrid('seed=7&mut=0.15');
       record('stage10: energy bit-exact; sum(R+G) conserved every gen; gate changes dynamics',
-        !r.mismatch && conserved && energy0 === ECO.ENERGY_E0 * pop0 && !eqBuf(base30, flag30),
-        `mismatch=${r.mismatch} sum0=${r.sums[0]} expected=${ECO.ENERGY_E0 * pop0} conserved=${conserved} diverged=${!eqBuf(base30, flag30)}`);
+        !r.mismatch && conserved && energy0 === expected0 && !eqBuf(base30, flag30),
+        `mismatch=${r.mismatch} sum0=${r.sums[0]} expected=${expected0} conserved=${conserved} diverged=${!eqBuf(base30, flag30)}`);
     }
 
-    // niche=1: GPU matches the CPU ref for 50 gens on the churning seed=7 soup
-    // (the death-scar field reaches richness — max B >= NICH_T — and the S234
-    // bonus changes dynamics vs the same soup without the flag at gen 50).
+    // niche=1: GPU matches the CPU ref for 300 gens on the churning seed=7
+    // soup (the death-scar field must reach richness — max B >= NICH_T=48,
+    // crossed around gen 140 while the soup still churns) and the S234 bonus
+    // changes dynamics vs the same soup without the flag.
     {
-      const r = await stepAndCompareEco({ flags: { niche: '1' }, mut: 0.15, seed: 7, seedOnly: true }, 50);
-      const base50 = await loadGrid('seed=7&mut=0.15', 50);
-      record('stage10: niche bit-exact vs CPU ref (50 gens); field reaches richness; S234 diverges',
-        !r.mismatch && r.maxB >= ECO.NICH_T && !eqBuf(base50, r.sGpu),
-        `mismatch=${r.mismatch} firstS=${r.firstS} maxB=${r.maxB} diverged=${!eqBuf(base50, r.sGpu)}`);
+      const r = await stepAndCompareEco({ flags: { niche: '1' }, mut: 0.15, seed: 7, seedOnly: true }, 300);
+      const base = await loadGrid('seed=7&mut=0.15', 300);
+      record('stage10: niche bit-exact vs CPU ref (300 gens); field reaches richness; S234 diverges',
+        !r.mismatch && r.maxB >= ECO.NICH_T && !eqBuf(base, r.sGpu),
+        `mismatch=${r.mismatch} firstS=${r.firstS} maxB=${r.maxB} diverged=${!eqBuf(base, r.sGpu)}`);
     }
 
     // age=1: GPU matches the CPU ref for 40 gens on the stamped mixed world
