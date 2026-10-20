@@ -1,5 +1,12 @@
 #version 300 es
-// Per-cell rules (stage 7) + mutation/lineage (stage 8). Byte layout:
+// Per-cell rules (stage 7) + mutation/lineage (stage 8) + ecology flags
+// (stage 10: freq/energy/niche/age). The four FREQ/ENERGY/NICHE/AGE macros
+// are injected by main.js from the URL flags BEFORE compile (values 0/1), so
+// every stage-10 block is preprocessed away when its flag is off — the
+// default Conway path compiles byte-for-byte the stage-8 shader (uniform
+// branches in the neighbor loop cost ~40% under SwiftShader even when never
+// taken; measured, then specialized).
+// Byte layout:
 //   R = (age << 1) | alive   — age = consecutive alive generations, saturates at 127
 //   G = birth mask   (bit n = born with n neighbors);     n==8 lives in A bit0
 //   B = survival mask (bit n = survives with n neighbors); n==8 lives in A bit1
@@ -14,6 +21,17 @@
 // 0..17) flips at bit (h/10000)%18 and, since XOR always changes the pack, the
 // newborn gets a fresh lineage id 1+((h>>9)%63) in A bits2-7. Survivors and
 // stamped cells never change id; all-id-0 worlds are bit-exact stage 7.
+// Stage 10 mechanisms (mirrored in tests/run.js cpuStepEco — keep identical):
+//   FREQ  1: living neighbors with popcount18(self^n) <= FREQ_SIM_DIST count
+//            as similar; a survivor with >= FREQ_PENALTY_T similar neighbors
+//            dies (frequency-dependent selection / RPS with mutation).
+//   AGE   1: a hash-selected donor younger than AGE_Y_MIN vetoes the birth;
+//            a survivor with age >= AGE_DEATH_START dies when
+//            h % 10000 < min(10000, (age-AGE_DEATH_START+1)*AGE_DEATH_STEP_BP).
+//   NICHE 1: a survivor with exactly 4 neighbors survives (S23 -> S234) when
+//            any living neighbor sits on niche-rich terrain (eco B >= NICH_T).
+//   ENERGY 1: a birth at p is vetoed when the location pool (eco G) < ENERGY_B_MIN.
+// Birth vetoes leave the cell dead with its ORIGINAL stored genome.
 // Hash (mirrored bit-for-bit in tests/run.js hashCell):
 //   h  = seed
 //   h ^= x * 374761393;      h  = (h ^ (h >> 13)) * 1274126177
@@ -23,12 +41,30 @@
 // Toroidal grid: neighbors wrap with integer modulo.
 precision highp float;
 uniform sampler2D uState;
+uniform sampler2D uEco; // eco texture (bound only when ENERGY||NICHE)
 uniform int uSize;
 uniform int uWrap; // always 1 (toroidal); no non-wrapping path yet
 uniform int uGen;  // generation this step computes from (hash input)
 uniform uint uSeed; // hash seed (?seed= wiring, stage 8)
 uniform int uMutBp; // mutation in basis points (0..10000 from ?mut=); 0 = off
 out vec4 outColor;
+
+// Stage-10 constants (mirrored: main.js ENERGY_E0 + tests/run.js ECO).
+#if FREQ == 1
+const int FREQ_SIM_DIST = 4;
+const int FREQ_PENALTY_T = 4;
+#endif
+#if ENERGY == 1
+const int ENERGY_B_MIN = 8;
+#endif
+#if NICHE == 1
+const int NICH_T = 8;
+#endif
+#if AGE == 1
+const int AGE_Y_MIN = 4;
+const int AGE_DEATH_START = 32;
+const int AGE_DEATH_STEP_BP = 800;
+#endif
 
 int byteOf(float f) { return int(f * 255.0 + 0.5); }
 
@@ -44,11 +80,42 @@ uint hashCell(uint x, uint y, uint g, uint s) {
   return h;
 }
 
+#if FREQ == 1
+// popcount over 18 bits (GLSL ES 3.00 has no bitCount): nibble LUT.
+int popcount18(uint v) {
+  const int lut[16] = int[16](0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4);
+  int c = 0;
+  for (int i = 0; i < 5; i++) {
+    c += lut[v & 15u];
+    v >>= 4;
+  }
+  return c;
+}
+#endif
+
 void main() {
   ivec2 p = ivec2(gl_FragCoord.xy);
+  vec4 self = texelFetch(uState, p, 0);
+  int r = byteOf(self.r);
+  int g = byteOf(self.g);
+  int b = byteOf(self.b);
+  int a = byteOf(self.a);
+  bool selfAlive = (r & 1) == 1;
+#if FREQ == 1
+  uint selfPack18 = uint(g) | (uint(b) << 8) | ((uint(a) & 3u) << 16);
+#endif
   int n = 0;
   int livingCount = 0;
   uint livingGenomes[8]; // at most 8 living neighbors in a 3x3 ring
+#if AGE == 1
+  uint livingAges[8];
+#endif
+#if FREQ == 1
+  int similarCount = 0;
+#endif
+#if NICHE == 1
+  bool nicheRich = false;
+#endif
   for (int dy = -1; dy <= 1; dy++) {
     for (int dx = -1; dx <= 1; dx++) {
       if (dx == 0 && dy == 0) continue;
@@ -63,22 +130,45 @@ void main() {
         uint tb = uint(byteOf(t.b));
         uint ta = uint(byteOf(t.a));
         livingGenomes[livingCount] = tg | (tb << 8) | (ta << 16);
+#if AGE == 1
+        livingAges[livingCount] = uint(byteOf(t.r) >> 1);
+#endif
         livingCount++;
+#if FREQ == 1
+        uint pack18 = tg | (tb << 8) | ((ta & 3u) << 16);
+        if (popcount18(selfPack18 ^ pack18) <= FREQ_SIM_DIST) similarCount++;
+#endif
+#if NICHE == 1
+        if (byteOf(texelFetch(uEco, q, 0).b) >= NICH_T) nicheRich = true;
+#endif
       }
     }
   }
-  vec4 self = texelFetch(uState, p, 0);
-  int r = byteOf(self.r);
-  int g = byteOf(self.g);
-  int b = byteOf(self.b);
-  int a = byteOf(self.a);
-  bool selfAlive = (r & 1) == 1;
   bool alive;
   if (n == 8) {
     alive = selfAlive ? ((a & 2) != 0) : ((a & 1) != 0);
   } else {
     alive = selfAlive ? (((b >> n) & 1) != 0) : (((g >> n) & 1) != 0);
   }
+#if NICHE == 1
+  // Niche bonus: survival gains n==4 on rich terrain (S23 -> S234).
+  if (selfAlive && !alive && n == 4 && nicheRich) alive = true;
+#endif
+#if FREQ == 1
+  // Frequency penalty: similar neighbors kill survivors (RPS pressure).
+  if (alive && selfAlive && similarCount >= FREQ_PENALTY_T) alive = false;
+#endif
+#if AGE == 1
+  // Natural death: chance grows with age (hash-driven, fixed-point).
+  if (alive && selfAlive) {
+    int age = r >> 1;
+    if (age >= AGE_DEATH_START) {
+      uint h = hashCell(uint(p.x), uint(p.y), uint(uGen), uSeed);
+      uint thr = uint(min(10000, (age - AGE_DEATH_START + 1) * AGE_DEATH_STEP_BP));
+      if ((h % 10000u) < thr) alive = false;
+    }
+  }
+#endif
   int outR = 0;
   uint outG = uint(g);
   uint outB = uint(b);
@@ -90,34 +180,55 @@ void main() {
     if (!selfAlive) {
       // Birth: inherit the full 24-bit pack of the hash-selected living
       // neighbor; with no living neighbors (only reachable with a B0-style
-      // birth mask) keep the cell's own stored genome. Mutation (uMutBp > 0)
-      // flips one rule bit and always assigns a fresh lineage id (XOR of one
-      // bit always changes the pack).
+      // birth mask) keep the cell's own stored genome. Ecology vetoes (young
+      // donor, empty pool) leave the cell dead with its original genome.
       uint genome;
       uint h = 0u;
+#if AGE == 1
+      int donorAge = 0;
+#endif
       if (livingCount > 0) {
         h = hashCell(uint(p.x), uint(p.y), uint(uGen), uSeed);
-        genome = livingGenomes[h % uint(livingCount)];
+        uint idx = h % uint(livingCount);
+        genome = livingGenomes[idx];
+#if AGE == 1
+        donorAge = int(livingAges[idx]);
+#endif
       } else {
         genome = uint(g) | (uint(b) << 8) | (uint(a) << 16);
       }
-      bool mutated = false;
-      if (uMutBp > 0) {
-        if (livingCount == 0) h = hashCell(uint(p.x), uint(p.y), uint(uGen), uSeed);
-        if ((h % 10000u) < uint(uMutBp)) {
-          uint bit = (h / 10000u) % 18u;
-          genome ^= (1u << bit);
-          uint lid = 1u + ((h >> 9) % 63u);
+      bool veto = false;
+#if AGE == 1
+      if (livingCount > 0 && donorAge < AGE_Y_MIN) veto = true;
+#endif
+#if ENERGY == 1
+      int pool = byteOf(texelFetch(uEco, p, 0).g);
+      if (pool < ENERGY_B_MIN) veto = true;
+#endif
+      if (veto) {
+        alive = false;
+        outR = 0;
+      } else {
+        // Mutation (uMutBp > 0) flips one rule bit and always assigns a
+        // fresh lineage id (XOR of one bit always changes the pack).
+        bool mutated = false;
+        if (uMutBp > 0) {
+          if (livingCount == 0) h = hashCell(uint(p.x), uint(p.y), uint(uGen), uSeed);
+          if ((h % 10000u) < uint(uMutBp)) {
+            uint bit = (h / 10000u) % 18u;
+            genome ^= (1u << bit);
+            uint lid = 1u + ((h >> 9) % 63u);
+            outG = genome & 0xFFu;
+            outB = (genome >> 8) & 0xFFu;
+            outA = ((genome >> 16) & 0x03u) | (lid << 2);
+            mutated = true;
+          }
+        }
+        if (!mutated) {
           outG = genome & 0xFFu;
           outB = (genome >> 8) & 0xFFu;
-          outA = ((genome >> 16) & 0x03u) | (lid << 2);
-          mutated = true;
+          outA = (genome >> 16) & 0xFFu;
         }
-      }
-      if (!mutated) {
-        outG = genome & 0xFFu;
-        outB = (genome >> 8) & 0xFFu;
-        outA = (genome >> 16) & 0xFFu;
       }
     }
   }

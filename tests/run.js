@@ -215,6 +215,164 @@ function cpuStepGenomeMut(state, size, gen, seed, mutBp) {
   return next;
 }
 
+// Stage 10: constants mirrored from sim.frag.glsl / eco.frag.glsl / main.js.
+const ECO = {
+  FREQ_SIM_DIST: 4,
+  FREQ_PENALTY_T: 4,
+  ENERGY_E0: 8,
+  ENERGY_B_MIN: 8,
+  NICH_T: 8,
+  AGE_Y_MIN: 4,
+  AGE_DEATH_START: 32,
+  AGE_DEATH_STEP_BP: 800,
+};
+
+function popcount18(v) {
+  let c = 0;
+  v = v >>> 0;
+  for (let i = 0; i < 18; i++) {
+    c += v & 1;
+    v >>>= 1;
+  }
+  return c;
+}
+
+// Stage 10: CPU reference for the ecology flags — sim pass mirrors sim.frag
+// (freq/age/niche/energy branches + mutation), eco pass mirrors eco.frag
+// (births/deaths diffed from old/new main, pool split/merge; niche B is a
+// monotone death scar: +1 on death, no birth write — see eco.frag header).
+// opts = { freq, energy, niche, age, mutBp }; returns { state, eco }.
+function cpuStepEco(state, eco, size, gen, seed, opts) {
+  const freq = opts.freq ? 1 : 0;
+  const energy = opts.energy ? 1 : 0;
+  const niche = opts.niche ? 1 : 0;
+  const age = opts.age ? 1 : 0;
+  const mutBp = opts.mutBp | 0;
+  const next = new Uint8Array(size * size * 4);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const si = (y * size + x) * 4;
+      const r = state[si];
+      const g = state[si + 1];
+      const b = state[si + 2];
+      const a = state[si + 3];
+      const selfAlive = (r & 1) === 1;
+      const selfPack18 = (g | (b << 8) | ((a & 3) << 16)) >>> 0;
+      let n = 0;
+      const living = [];
+      const livingAges = [];
+      let similarCount = 0;
+      let nicheRich = false;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          if (dx === 0 && dy === 0) continue;
+          const qx = (x + dx + size) % size;
+          const qy = (y + dy + size) % size;
+          const i = (qy * size + qx) * 4;
+          if (state[i] & 1) {
+            n++;
+            const tg = state[i + 1];
+            const tb = state[i + 2];
+            const ta = state[i + 3];
+            living.push((tg | (tb << 8) | (ta << 16)) >>> 0);
+            livingAges.push(state[i] >> 1);
+            if (freq) {
+              const pack18 = (tg | (tb << 8) | ((ta & 3) << 16)) >>> 0;
+              if (popcount18(selfPack18 ^ pack18) <= ECO.FREQ_SIM_DIST) similarCount++;
+            }
+            if (niche && eco[i + 2] >= ECO.NICH_T) nicheRich = true;
+          }
+        }
+      }
+      let alive;
+      if (n === 8) {
+        alive = selfAlive ? ((a & 2) !== 0) : ((a & 1) !== 0);
+      } else {
+        alive = selfAlive ? (((b >> n) & 1) !== 0) : (((g >> n) & 1) !== 0);
+      }
+      if (niche && selfAlive && !alive && n === 4 && nicheRich) alive = true;
+      if (alive && selfAlive && freq && similarCount >= ECO.FREQ_PENALTY_T) alive = false;
+      if (alive && selfAlive && age) {
+        const curAge = r >> 1;
+        if (curAge >= ECO.AGE_DEATH_START) {
+          const h = hashCell(x, y, gen, seed);
+          const thr = Math.min(10000, (curAge - ECO.AGE_DEATH_START + 1) * ECO.AGE_DEATH_STEP_BP);
+          if ((h % 10000) < thr) alive = false;
+        }
+      }
+      let outR = 0;
+      let outG = g;
+      let outB = b;
+      let outA = a;
+      if (alive) {
+        let curAge = r >> 1;
+        if (curAge < 127) curAge += 1;
+        outR = (curAge << 1) | 1;
+        if (!selfAlive) {
+          let genome;
+          let donorAge = 0;
+          let h = 0;
+          if (living.length > 0) {
+            h = hashCell(x, y, gen, seed);
+            const idx = h % living.length;
+            genome = living[idx];
+            donorAge = livingAges[idx];
+          } else {
+            genome = (g | (b << 8) | (a << 16)) >>> 0;
+          }
+          let veto = false;
+          if (age && living.length > 0 && donorAge < ECO.AGE_Y_MIN) veto = true;
+          if (energy && eco[si + 1] < ECO.ENERGY_B_MIN) veto = true;
+          if (veto) {
+            outR = 0;
+          } else {
+            if (living.length === 0) h = hashCell(x, y, gen, seed);
+            if (mutBp > 0 && (h % 10000) < mutBp) {
+              const bit = Math.floor(h / 10000) % 18;
+              genome = (genome ^ (1 << bit)) >>> 0;
+              const lid = 1 + ((h >>> 9) % 63);
+              outG = genome & 0xFF;
+              outB = (genome >>> 8) & 0xFF;
+              outA = ((genome >>> 16) & 0x03) | (lid << 2);
+            } else {
+              outG = genome & 0xFF;
+              outB = (genome >>> 8) & 0xFF;
+              outA = (genome >>> 16) & 0xFF;
+            }
+          }
+        }
+      }
+      next[si] = outR;
+      next[si + 1] = outG;
+      next[si + 2] = outB;
+      next[si + 3] = outA;
+    }
+  }
+  const nextEco = new Uint8Array(size * size * 4);
+  for (let i = 0; i < size * size; i++) {
+    const si = i * 4;
+    const oldAlive = state[si] & 1;
+    const newAlive = next[si] & 1;
+    let er = eco[si];
+    let eg = eco[si + 1];
+    let eb = eco[si + 2];
+    if (!oldAlive && newAlive) {
+      const part = eg >> 1;
+      er = part;
+      eg = eg - part;
+    } else if (oldAlive && !newAlive) {
+      eg = eg + er;
+      er = 0;
+      eb = eb < 255 ? eb + 1 : eb;
+    }
+    nextEco[si] = er;
+    nextEco[si + 1] = eg;
+    nextEco[si + 2] = eb;
+    nextEco[si + 3] = 0;
+  }
+  return { state: next, eco: nextEco };
+}
+
 function toRgba(grid) {
   const buf = new Uint8Array(grid.length * 4);
   for (let i = 0; i < grid.length; i++) {
@@ -1376,6 +1534,195 @@ async function main() {
       && gifOk,
       `reproUrl=${entry.reproUrl} gif=${entry.gif} gifSkip=${entry.gifSkip}`);
     fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
+  // ---- Stage 10: ecology (freq/energy/niche/age) ----
+  {
+    const readRaw64 = () => page.evaluate(() => Array.from(window.__life.readRaw(0, 0, 64, 64)));
+    const readEco64 = () => page.evaluate(() => {
+      const b = window.__life.readEco();
+      return b ? Array.from(b) : null;
+    });
+    const readRaw64EcoOrNull = async () => {
+      const v = await readEco64();
+      return v === null ? null : Uint8Array.from(v);
+    };
+    const stampMixed = () => page.evaluate(() => {
+      window.__life.setAuto(false);
+      window.__life.setGenome('conway');
+      window.__life.clear();
+      for (let y = 0; y < 64; y++) {
+        for (let x = 0; x < 64; x++) {
+          const left = x < 32;
+          const alive = left ? ((x * 3 + y * 5) % 7 < 3) : ((x * 5 + y * 3) % 11 < 4);
+          if (alive) {
+            window.__life.setGenome(left ? 'conway' : 'highlife');
+            window.__life.stampBrush(x, y, 0);
+          }
+        }
+      }
+      window.__life.setGenome('conway');
+    });
+    const eqBuf = (x, y) => {
+      if (x === null || y === null || x.length !== y.length) return false;
+      for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+      return true;
+    };
+    const firstDiff = (x, y) => {
+      for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return i;
+      return -1;
+    };
+    const stepAndCompareEco = async (opts, gens) => {
+      // Loads ?size=64 + flags + mut, stamps the mixed world, then steps gens
+      // against cpuStepEco (state AND eco) bit-exactly. Returns { diverged,
+      // maxB, sums } where sums tracks sum(R)+sum(G) per gen for conservation.
+      const q = new URLSearchParams({ size: '64', sps: '0.0001' });
+      if (opts.flags) for (const [k, v] of Object.entries(opts.flags)) q.set(k, v);
+      if (opts.mut) q.set('mut', String(opts.mut));
+      if (opts.seed !== undefined) q.set('seed', String(opts.seed));
+      await page.goto(`${base}?${q}`);
+      await page.waitForFunction(() => !!window.__life || !!document.getElementById('error'));
+      if (!opts.seedOnly) await stampMixed();
+      await page.evaluate(() => window.__life.setAuto(false));
+      const s0 = Uint8Array.from(await readRaw64());
+      // Eco textures exist only when energy|niche. For freq/age-only runs use
+      // a synthetic all-zero eco on the CPU side: with energy=0/niche=0 the
+      // CPU eco pass is a no-op (zero pool splits, zero niche writes), matching
+      // the GPU where the eco pass never runs.
+      const e0raw = await readRaw64EcoOrNull();
+      const e0 = e0raw === null ? new Uint8Array(s0.length) : Uint8Array.from(e0raw);
+      const hasEcoTex = e0raw !== null;
+      const gen0 = await page.evaluate(() => window.__life.generation());
+      const hashSeed = opts.seed !== undefined && opts.seed !== 'demo' ? Number(opts.seed) : 0;
+      const refOpts = {
+        freq: opts.flags && opts.flags.freq ? 1 : 0,
+        energy: opts.flags && opts.flags.energy ? 1 : 0,
+        niche: opts.flags && opts.flags.niche ? 1 : 0,
+        age: opts.flags && opts.flags.age ? 1 : 0,
+        mutBp: Math.round((opts.mut || 0) * 10000),
+      };
+      let s = s0;
+      let e = e0;
+      let diverged = false;
+      let maxB = 0;
+      const sums = [];
+      for (let g = 0; g <= gens; g++) {
+        if (hasEcoTex) {
+          let sum = 0;
+          for (let i = 0; i < e.length; i += 4) sum += e[i] + e[i + 1];
+          sums.push(sum);
+          for (let i = 2; i < e.length; i += 4) if (e[i] > maxB) maxB = e[i];
+        }
+        if (g === gens) break;
+        await page.evaluate(() => window.__life.step(1));
+        const r = cpuStepEco(s, e, 64, gen0 + g, hashSeed, refOpts);
+        s = r.state;
+        e = r.eco;
+      }
+      const sGpu = Uint8Array.from(await readRaw64());
+      if (!eqBuf(s, sGpu)) diverged = true;
+      let firstE = -1;
+      if (hasEcoTex) {
+        const eGpu = await readEco64();
+        if (!eqBuf(e, eGpu)) {
+          diverged = true;
+          firstE = firstDiff(e, eGpu);
+        }
+      }
+      return { mismatch: diverged, firstS: firstDiff(s, sGpu), firstE, maxB, sums, sGpu };
+    };
+    const loadGrid = async (query, gens = 30) => {
+      await page.goto(`${base}?size=64&sps=0.0001&${query}`);
+      await page.waitForFunction(() => !!window.__life || !!document.getElementById('error'));
+      await page.evaluate(() => window.__life.setAuto(false));
+      await page.evaluate((n) => window.__life.step(n), gens);
+      return Uint8Array.from(await readRaw64());
+    };
+
+    // freq=1: GPU matches the CPU ref bit-exact for 30 gens and the dynamics
+    // diverge from the same world without the flag (RPS pressure kills
+    // survivors with >= 4 similar neighbors).
+    {
+      const r = await stepAndCompareEco({ flags: { freq: '1' }, mut: 0.15 }, 30);
+      const base30 = await loadGrid('seed=7&mut=0.15');
+      const flag30 = await loadGrid('seed=7&mut=0.15&freq=1');
+      record('stage10: freq bit-exact vs CPU ref (30 gens); diverges from baseline',
+        !r.mismatch && !eqBuf(base30, flag30),
+        `mismatch=${r.mismatch} firstS=${r.firstS} firstE=${r.firstE} diverged=${!eqBuf(base30, flag30)}`);
+    }
+
+    // energy=1: GPU matches the CPU ref for 30 gens; total energy sum(R)+sum(G)
+    // is invariant every generation (= 8 * initial population) and the gate
+    // (pool < 8 vetoes births) changes dynamics vs baseline.
+    {
+      const r = await stepAndCompareEco({ flags: { energy: '1' }, mut: 0.15, seed: 7, seedOnly: true }, 30);
+      const conserved = r.sums.every((v) => v === r.sums[0]);
+      const pop0 = (await (async () => {
+        await page.goto(`${base}?size=64&sps=0.0001&seed=7`);
+        await page.waitForFunction(() => !!window.__life);
+        const raw = Uint8Array.from(await readRaw64());
+        let p = 0;
+        for (let i = 0; i < raw.length; i += 4) if (raw[i] & 1) p++;
+        return p;
+      })());
+      const energy0 = conserved ? r.sums[0] : -1;
+      const flag30 = await loadGrid('seed=7&mut=0.15&energy=1');
+      const base30 = await loadGrid('seed=7&mut=0.15');
+      record('stage10: energy bit-exact; sum(R+G) conserved every gen; gate changes dynamics',
+        !r.mismatch && conserved && energy0 === ECO.ENERGY_E0 * pop0 && !eqBuf(base30, flag30),
+        `mismatch=${r.mismatch} sum0=${r.sums[0]} expected=${ECO.ENERGY_E0 * pop0} conserved=${conserved} diverged=${!eqBuf(base30, flag30)}`);
+    }
+
+    // niche=1: GPU matches the CPU ref for 50 gens on the churning seed=7 soup
+    // (the death-scar field reaches richness — max B >= NICH_T — and the S234
+    // bonus changes dynamics vs the same soup without the flag at gen 50).
+    {
+      const r = await stepAndCompareEco({ flags: { niche: '1' }, mut: 0.15, seed: 7, seedOnly: true }, 50);
+      const base50 = await loadGrid('seed=7&mut=0.15', 50);
+      record('stage10: niche bit-exact vs CPU ref (50 gens); field reaches richness; S234 diverges',
+        !r.mismatch && r.maxB >= ECO.NICH_T && !eqBuf(base50, r.sGpu),
+        `mismatch=${r.mismatch} firstS=${r.firstS} maxB=${r.maxB} diverged=${!eqBuf(base50, r.sGpu)}`);
+    }
+
+    // age=1: GPU matches the CPU ref for 40 gens on the stamped mixed world
+    // (donor veto + natural death with ages reaching >= 32) and diverges from
+    // the seed=7 soup without the flag at the same gen count.
+    {
+      const r = await stepAndCompareEco({ flags: { age: '1' }, mut: 0.15 }, 40);
+      const base40 = await loadGrid('seed=7&mut=0.15', 40);
+      const age40 = await loadGrid('seed=7&mut=0.15&age=1', 40);
+      record('stage10: age bit-exact vs CPU ref (40 gens); lifecycle diverges from baseline',
+        !r.mismatch && !eqBuf(base40, age40),
+        `mismatch=${r.mismatch} firstS=${r.firstS} diverged=${!eqBuf(base40, age40)}`);
+    }
+
+    // Combo: all four mechanisms + mutation together, 50 gens bit-exact on
+    // BOTH main and eco textures.
+    {
+      const r = await stepAndCompareEco({
+        flags: { freq: '1', energy: '1', niche: '1', age: '1' },
+        mut: 0.15, seed: 7, seedOnly: true,
+      }, 50);
+      record('stage10: freq+energy+niche+age+mut combo bit-exact (50 gens, main+eco)',
+        !r.mismatch,
+        `mismatch=${r.mismatch} firstS=${r.firstS} firstE=${r.firstE} maxB=${r.maxB}`);
+    }
+
+    // Flags off: eco pair never allocated, readEco null. Freq/age alone also
+    // need no eco textures (pure sim-shader mechanisms).
+    {
+      await page.goto(`${base}?size=${SIZE}&sps=0.0001`);
+      await page.waitForFunction(() => !!window.__life);
+      await page.evaluate(() => window.__life.setAuto(false));
+      const nullEco = await page.evaluate(() => window.__life.readEco());
+      await page.goto(`${base}?size=${SIZE}&sps=0.0001&freq=1&age=1`);
+      await page.waitForFunction(() => !!window.__life);
+      await page.waitForTimeout(400);
+      const cFA = await page.evaluate(() => window.__counters);
+      record('stage10: no eco textures without energy/niche; readEco null when off',
+        nullEco === null && cFA.textures === 2 && cFA.framebuffers === 2,
+        `readEco=${nullEco === null ? 'null' : typeof nullEco} textures=${cFA.textures} fbos=${cFA.framebuffers}`);
+    }
   }
 
   record(

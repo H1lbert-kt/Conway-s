@@ -127,6 +127,9 @@ const PATTERNS = {
 
 const MAX_BRUSH_SIDE = 65;
 const MAX_STEPS_PER_FRAME = 8;
+// Stage 10: initial cell energy (eco R channel) when ?energy=1. Mirrored in
+// tests/run.js ENERGY_E0 and the ENERGY_B_MIN gate in sim.frag.glsl.
+const ENERGY_E0 = 8;
 // Genome presets: G = birth mask, B = survival mask (byte layout, stage 6+).
 const GENOME_PRESETS = {
   conway: { birth: 0x08, surv: 0x0c }, // B3/S23
@@ -139,17 +142,52 @@ async function main() {
     loadText('shaders/sim.vert.glsl'),
     loadText('shaders/sim.frag.glsl'),
     loadText('shaders/display.frag.glsl'),
+    loadText('shaders/eco.frag.glsl'),
   ]);
-  const simProgram = linkProgram(sources[0], sources[1]);
+
+  // Stage 10: parse the four URL flags FIRST — sim.frag is specialized at
+  // compile time via injected #defines (uniform branches in the neighbor loop
+  // cost ~40% in the software rasterizer even when never taken; measured).
+  // Off flags preprocess their whole block away → default path compiles the
+  // stage-8 shader.
+  const searchParams = new URLSearchParams(location.search);
+  const flagOn = (name) => {
+    const v = searchParams.get(name);
+    return v !== null && v !== '0';
+  };
+  const ecoFreq = flagOn('freq') ? 1 : 0;
+  const ecoEnergy = flagOn('energy') ? 1 : 0;
+  const ecoNiche = flagOn('niche') ? 1 : 0;
+  const ecoAge = flagOn('age') ? 1 : 0;
+  const ecoOn = (ecoEnergy || ecoNiche) ? 1 : 0;
+  const simDefines = '#define FREQ ' + ecoFreq + '\n'
+    + '#define ENERGY ' + ecoEnergy + '\n'
+    + '#define NICHE ' + ecoNiche + '\n'
+    + '#define AGE ' + ecoAge + '\n';
+
+  // #version must stay first: splice the defines after it, not before.
+  const specialize = (src) => {
+    const nl = src.indexOf('\n');
+    return src.slice(0, nl + 1) + simDefines + src.slice(nl + 1);
+  };
+
+  const simProgram = linkProgram(sources[0], specialize(sources[1]));
   const displayProgram = linkProgram(sources[0], sources[2]);
+  const ecoProgram = linkProgram(sources[0], sources[3]);
 
   const simLoc = {
     uState: gl.getUniformLocation(simProgram, 'uState'),
+    uEco: gl.getUniformLocation(simProgram, 'uEco'),
     uSize: gl.getUniformLocation(simProgram, 'uSize'),
     uWrap: gl.getUniformLocation(simProgram, 'uWrap'),
     uGen: gl.getUniformLocation(simProgram, 'uGen'),
     uSeed: gl.getUniformLocation(simProgram, 'uSeed'),
     uMutBp: gl.getUniformLocation(simProgram, 'uMutBp'),
+  };
+  const ecoLoc = {
+    uMainOld: gl.getUniformLocation(ecoProgram, 'uMainOld'),
+    uMainNew: gl.getUniformLocation(ecoProgram, 'uMainNew'),
+    uEco: gl.getUniformLocation(ecoProgram, 'uEco'),
   };
   const displayLoc = {
     uState: gl.getUniformLocation(displayProgram, 'uState'),
@@ -165,6 +203,11 @@ async function main() {
   let fbos = targets.fbos;
   let read = 0;
   let write = 1;
+  let ecoTargets = ecoOn ? createSimTargets(size) : null;
+  let ecoTextures = ecoTargets ? ecoTargets.textures : null;
+  let ecoFbos = ecoTargets ? ecoTargets.fbos : null;
+  let ecoRead = 0;
+  let ecoWrite = 1;
   let generation = 0;
   let activeGenome = GENOME_PRESETS[DEFAULT_GENOME];
 
@@ -187,6 +230,7 @@ async function main() {
   const patchBuf = new Uint8Array(MAX_BRUSH_SIDE * MAX_BRUSH_SIDE * 4);
   const packBuf = new Uint8Array(MAX_BRUSH_SIDE * MAX_BRUSH_SIDE * 4);
   let fullBuf = new Uint8Array(size * size * 4);
+  let ecoBuf = ecoOn ? new Uint8Array(size * size * 4) : null;
 
   // Stage 8: living-lineage count. Frozen rule 4 — readPixels only OUTSIDE the
   // auto-stepping loop, and only from the paused 1 Hz HUD tick. Pause/step
@@ -248,7 +292,6 @@ async function main() {
   // the sim hash (uSeed) with the same mapping — full reproducibility from
   // ?seed= + ?mut=.
   const DEMO_SEED = 0x2F6E2B1;
-  const searchParams = new URLSearchParams(location.search);
   const mutParam = Number(searchParams.get('mut'));
   const mutBp = Number.isFinite(mutParam) && mutParam > 0
     ? Math.min(10000, Math.round(mutParam * 10000))
@@ -258,6 +301,28 @@ async function main() {
     ? 0
     : (seedParam === 'demo' ? DEMO_SEED : Number(seedParam) >>> 0);
 
+  // Stage 10: eco ping-pong upload into the live eco texture (read target).
+  // Full-grid only; mirrors uploadPatch but targets the eco pair.
+  function uploadEco(buf) {
+    if (!ecoOn) return;
+    gl.bindTexture(gl.TEXTURE_2D, ecoTextures[ecoRead]);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, size, size, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+  }
+
+  // Stage 10: ecoBuf[i] = alive ? E0 : 0 from a CPU-side alive bitmap (never
+  // GPU readback — stage-8 lesson: readPixels mid-session drains the queue).
+  function fillEcoBuf(aliveAt) {
+    if (!ecoOn) return;
+    const n = size * size;
+    for (let i = 0; i < n; i++) {
+      ecoBuf[i * 4] = aliveAt(i) ? ENERGY_E0 : 0;
+      ecoBuf[i * 4 + 1] = 0;
+      ecoBuf[i * 4 + 2] = 0;
+      ecoBuf[i * 4 + 3] = 0;
+    }
+  }
+
   function stepOnce() {
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbos[write]);
     gl.viewport(0, 0, size, size);
@@ -265,12 +330,37 @@ async function main() {
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, textures[read]);
     gl.uniform1i(simLoc.uState, 0);
+    if (ecoOn) {
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, ecoTextures[ecoRead]);
+      gl.uniform1i(simLoc.uEco, 1);
+    }
     gl.uniform1i(simLoc.uSize, size);
     gl.uniform1i(simLoc.uWrap, 1);
     gl.uniform1i(simLoc.uGen, generation);
     gl.uniform1ui(simLoc.uSeed, hashSeed);
     gl.uniform1i(simLoc.uMutBp, mutBp);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+    if (ecoOn) {
+      // Eco pass: diff main-read vs main-write (births/deaths the sim just
+      // decided) + current eco-read -> eco-write; then swap eco ping-pong.
+      gl.bindFramebuffer(gl.FRAMEBUFFER, ecoFbos[ecoWrite]);
+      gl.viewport(0, 0, size, size);
+      gl.useProgram(ecoProgram);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, textures[read]);
+      gl.uniform1i(ecoLoc.uMainOld, 0);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, textures[write]);
+      gl.uniform1i(ecoLoc.uMainNew, 1);
+      gl.activeTexture(gl.TEXTURE2);
+      gl.bindTexture(gl.TEXTURE_2D, ecoTextures[ecoRead]);
+      gl.uniform1i(ecoLoc.uEco, 2);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      const er = ecoRead;
+      ecoRead = ecoWrite;
+      ecoWrite = er;
+    }
     read = write;
     write ^= 1;
     generation++;
@@ -361,6 +451,8 @@ async function main() {
       fullBuf[i * 4 + 3] = 0;
     }
     uploadPatch(0, 0, size, size, fullBuf);
+    fillEcoBuf(() => 0);
+    uploadEco(ecoBuf);
   }
 
   function randomize() {
@@ -372,6 +464,8 @@ async function main() {
       fullBuf[i * 4 + 3] = 0;
     }
     uploadPatch(0, 0, size, size, fullBuf);
+    fillEcoBuf((i) => fullBuf[i * 4] & 1);
+    uploadEco(ecoBuf);
   }
 
   function seededFill(seed) {
@@ -384,6 +478,8 @@ async function main() {
       fullBuf[i * 4 + 3] = 0;
     }
     uploadPatch(0, 0, size, size, fullBuf);
+    fillEcoBuf((i) => fullBuf[i * 4] & 1);
+    uploadEco(ecoBuf);
   }
 
   function initSeed() {
@@ -407,6 +503,18 @@ async function main() {
     fullBuf = new Uint8Array(size * size * 4);
     countBuf = new Uint8Array(size * size * 4);
     lineageCount = 1;
+    if (ecoOn) {
+      for (let i = 0; i < 2; i++) {
+        gl.deleteFramebuffer(ecoFbos[i]);
+        gl.deleteTexture(ecoTextures[i]);
+      }
+      ecoTargets = createSimTargets(size);
+      ecoTextures = ecoTargets.textures;
+      ecoFbos = ecoTargets.fbos;
+      ecoRead = 0;
+      ecoWrite = 1;
+      ecoBuf = new Uint8Array(size * size * 4);
+    }
     window.__life.size = size;
     fitView();
   }
@@ -554,6 +662,18 @@ async function main() {
       gl.bindTexture(gl.TEXTURE_2D, textures[read]);
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
       gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, data);
+      if (ecoOn) {
+        // Eco re-init from the CPU-side alive bits (no GPU readback).
+        const m = size * size;
+        for (let i = 0; i < m; i++) {
+          const alive = i < n ? (data[i * 4] & 1) : 0;
+          ecoBuf[i * 4] = alive ? ENERGY_E0 : 0;
+          ecoBuf[i * 4 + 1] = 0;
+          ecoBuf[i * 4 + 2] = 0;
+          ecoBuf[i * 4 + 3] = 0;
+        }
+        uploadEco(ecoBuf);
+      }
     },
     read: function (x, y, w, h) {
       const buf = new Uint8Array(w * h * 4);
@@ -568,6 +688,16 @@ async function main() {
       const buf = new Uint8Array(w * h * 4);
       gl.bindFramebuffer(gl.FRAMEBUFFER, fbos[read]);
       gl.readPixels(x, y, w, h, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      return buf;
+    },
+    // Stage 10: full eco texture readback (R=cell energy, G=pool, B=niche).
+    // Validation path only (like readRaw) — never inside the render loop.
+    readEco: function () {
+      if (!ecoOn) return null;
+      const buf = new Uint8Array(size * size * 4);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, ecoFbos[ecoRead]);
+      gl.readPixels(0, 0, size, size, gl.RGBA, gl.UNSIGNED_BYTE, buf);
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       return buf;
     },

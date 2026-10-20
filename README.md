@@ -25,6 +25,10 @@ Qualquer servidor estático serve (`npx serve`, `php -S`, etc.). Não há build,
 | `?sps=30` | Gerações por segundo iniciais (1–120 via slider; o parâmetro é o valor de carga). |
 | `?seed=demo` | Estado inicial determinístico (PRNG mulberry32 com seed fixa). `?seed=<n>` usa o inteiro informado. Sem parâmetro: grid vazio. A seed também alimenta o hash de herança/mutação da simulação (mesmo mapeamento do fill: `demo` → constante fixa, ausente → 0, senão o inteiro) — loadings iguais evoluem bit-identicalmente. |
 | `?mut=0.05` | Taxa de mutação por nascimento, em fração (0–1; clampado). Padrão: 0 (sem mutação, comportamento Stage 7 bit-exato). Cada nascimento sorteia via hash: com probabilidade `mut` flipa 1 dos 18 bits de regra e o recém-nascido ganha uma linhagem nova (id 1–63). Ver “Mutação e linhagens”. |
+| `?freq=1` | Seleção dependente de frequência (Stage 10). Qualquer valor ≠ `0`/ausente liga; padrão desligado = Conway exato. Ver “Ecologia”. |
+| `?energy=1` | Recurso de energia conservado (Stage 10). Liga a textura de eco + passe `eco.frag`. |
+| `?niche=1` | Campo de nicho/terreno (Stage 10). Usa o mesmo par de texturas de eco. |
+| `?age=1` | Ciclo de vida por idade (Stage 10): doador jovem não reproduz, morte natural crescente. |
 
 ## Controles
 
@@ -50,7 +54,7 @@ pnpm install   # só playwright-core, dev-dependency do harness
 pnpm test
 ```
 
-O harness (`tests/run.js`, Playwright + Chromium headless) roda **65 verificações** (os 49 testes originais, intocados, + 3 da Stage 6, + 4 da Stage 7, + 5 da Stage 8, + 4 da Stage 9) e imprime PASS/FAIL por critério, com exit code ≠ 0 em falha. Ele valida:
+O harness (`tests/run.js`, Playwright + Chromium headless) roda **71 verificações** (os 49 testes originais, intocados, + 3 da Stage 6, + 4 da Stage 7, + 5 da Stage 8, + 4 da Stage 9, + 6 da Stage 10) e imprime PASS/FAIL por critério, com exit code ≠ 0 em falha. Ele valida:
 
 - **Fidelidade bit-a-bit contra uma referência CPU da B3/S23**: blinker, block, glider (interior e **atravessando a costura do toro**), e Gosper gun por 60 gerações.
 - **Golden do Gosper gun** (valores canônicos, não só CPU-vs-GPU): população **36/41/46** nas gerações 0/30/60 em grid 128², e os offsets exatos dos gliders emitidos (fixados no teste, derivados da referência CPU e conferidos contra as populações canônicas).
@@ -63,6 +67,7 @@ O harness (`tests/run.js`, Playwright + Chromium headless) roda **65 verificaç�
 - **Genoma por célula (Stage 7):** stamping com os presets Conway/HighLife afirmado via `readRaw`, nascimento herdando o genoma do vizinho escolhido pelo hash, n==8 indexando os bits do canal A, e grid misto Conway/HighLife bit-exato (uvec4) contra a referência CPU por 50 gerações — a prova de paridade do hash JS/GLSL (qualquer divergência diverge rápido).
 - **Mutação e linhagens (Stage 8):** `mut=0`/ausente mantém o comportamento Stage 7 bit-exato e todos os ids de linhagem em 0; `mut=0.15` produz ids distintos em A bits2–7 com o grid GPU bit-exato (uvec4) contra a referência CPU com mutação por 50 gerações; cor: linhagem 0 mantém o branco-clássico e célula mutada bate (±8) com a referência HSL computada no teste para o id dela; HUD pausado conta as linhagens vivas (mundo Conway puro = 1, após mutações ≥ 2); e determinismo: duas loads com o mesmo `?seed=`+`?mut=` evoluem idênticas, com `?mut=` diferente divergem.
 - **Explorador de novidade (Stage 9):** unitários dos filtros boring (morre/congelou/ruído) e da distância de novelty; determinismo byte-a-byte de `run.json`+`archive.json` entre duas execuções do explorador (mundos still-life em dirs temporários, o archive real nunca é tocado); smoke: still filtrado como frozen, entrada de galeria completa (`reproUrl` no formato certo, métricas numéricas, GIF presente quando ffmpeg existe / `gifSkip` explícito quando não).
+- **Ecologia (Stage 10):** cada mecanismo (`?freq`, `?energy`, `?niche`, `?age`) bit-exato contra a referência CPU com eco (≥30–50 gerações); conservação: `sum(R+G)` da textura de eco constante a cada geração e igual a `ENERGY_E0 × população inicial`; nicho: campo atinge riqueza (`B ≥ 8`) e o bônus S234 diverge do baseline na geração esperada; combo com os quatro flags + `?mut=` bit-exato por 50 gerações (main + eco); e **sem texturas de eco quando `?energy`/`?niche` estão off** (`readEco` retorna `null`, contadores `textures=2`).
 
 O `readPixels` acontece **exclusivamente fora do stepping automático**: no caminho de validação/teste e no tick de 1 Hz do HUD **somente com a simulação pausada** — nunca em handlers de input nem durante o stepping (comprovado pelo teste de higiene: 0 `readPixels` durante a medição com auto-stepping ligado).
 
@@ -78,6 +83,7 @@ Ambiente: Chromium headless + **SwiftShader (rasterizador por software)** — ou
 | Sim + display @4096² (`sps=120`) | **~4.5–10.5** | 16.7M fragmentos × 9 `texelFetch` no rasterizador de **software**. |
 | Sim + display @4096², Stage 7 (perfil da suíte) | **~5.5** | Regra por máscara + herança ativas: dentro da faixa da Stage 6 (4.5–10.5) — custo extra ≈ 0, os canais vêm dos mesmos 9 `texelFetch`. |
 | Sim + display @4096², Stage 8 (`mut=0`, default) | **na mesma faixa** | `mut=0` mantém exatamente o caminho de código da Stage 7 (branch de mutação não entra; mesmo hash de herança por nascimento) — custo extra ≈ 0. Com `?mut>0` o custo é ~1 hash adicional por nascimento, o mesmo custo por nascimento já existente do herding. |
+| Sim + display @4096², Stage 10 (default × cada flag × combo) | **na mesma faixa** | Todos os quatro mecanismos são **especializados em tempo de compilação** (`#define` injetado no load) — com flag off o bloco some do shader. Interpolação default×combo: 2,47 vs 2,49 gen/s; A/B contra o HEAD baseline: paridade. Ver “Ecologia”. |
 
 Referência da Stage 5 (antes do byte layout, sob carga alta): display ~27 fps em 64² **e** 4096²; sim+display ~146–162 fps @64², ~4.5–6 fps @4096² — o decode por round-trip da Stage 6 é neutro dentro da variância de carga (o custo dominante continua sendo o rasterizador de software).
 
@@ -121,6 +127,25 @@ Referência da Stage 5 (antes do byte layout, sob carga alta): display ~27 fps e
 - **Pintura/patterns/seed** entram por `texSubImage2D` direto na textura viva (até 4 splits quando o retângulo cruza a borda), escrevendo o byte layout com as máscaras do **genoma selecionado** (viva = `(1, G, B, 0)`, morta = `(0, G, B, 0)`; Conway = `(1,8,12,0)` / `(0,8,12,0)`). Sem alocação por evento (`patchBuf`/`packBuf`/`fullBuf` alocados uma vez).
 - A próxima geração é **consumida do texel `read`** no passo seguinte — pinturas caem estritamente entre passos (single-threaded).
 - Hooks de validação: `__life.read()` devolve canal 0 como 0/255 (contrato do harness); `__life.readRaw()` devolve os bytes brutos do layout — só fora do loop.
+
+## Ecologia (Stage 10)
+
+Quatro mecanismos anti-convergência, cada um ligável por flag de URL e **desligado por padrão** (mundo default = Conway bit-exato, goldens intactos). Cada flag é parseada uma vez no load; qualquer valor exceto `0`/ausente liga.
+
+| Flag | Mecanismo | Constantes |
+|---|---|---|
+| `?freq=1` | **Seleção por frequência:** sobrevivente com ≥ `FREQ_PENALTY_T` vizinhos vivos “parecidos” (distância `popcount18(self ^ vizinho) ≤ FREQ_SIM_DIST` sobre os 18 bits de genoma) morre — dinâmica RPS com a mutação da Stage 8. | `FREQ_SIM_DIST = 4`, `FREQ_PENALTY_T = 4` |
+| `?energy=1` | **Energia conservada:** energia vive no par de texturas de eco (canal R = energia da célula, G = pool do local). Morte funde R→G no pool (nada é criado); nascimento exige `pool ≥ ENERGY_B_MIN` (senão o nascimento é veto e a célula mantém o genoma original) e o filho recebe metade do pool (R←`g>>1`). Invariante por texel: `R + G` só se desloca entre célula e pool ⇒ **soma global constante = `ENERGY_E0 × população inicial`** (assertado a cada geração no teste). | `ENERGY_E0 = 8`, `ENERGY_B_MIN = 8` |
+| `?niche=1` | **Campo de nicho (terreno):** canal B do eco, monotônico — **morte** escreve `+1` no local (satura em 255, sem escrita em nascimento; ver nota abaixo), sobrevivente com ≥ 1 vizinho vivo sobre terreno rico (`B ≥ NICH_T`) ganha sobrevivência com n==4 (bônus `S23 → S234`). | `NICH_T = 8` |
+| `?age=1` | **Idade no ciclo de vida:** doador com idade `< AGE_Y_MIN` veta o nascimento; sobrevivente com idade `≥ AGE_DEATH_START` morre com chance `min(10000, (idade−AGE_DEATH_START+1)·AGE_DEATH_STEP_BP)` em pontos-base via o hash da célula. | `AGE_Y_MIN = 4`, `AGE_DEATH_START = 32`, `AGE_DEATH_STEP_BP = 800` |
+
+Todas as constantes são **espelhadas três vezes** e devem ser alteradas juntas: `const` no `shaders/sim.frag.glsl`, `ENERGY_E0`/objeto em `main.js`, objeto `ECO` em `tests/run.js` (a referência CPU é a autoridade dos testes).
+
+**Nota de projeto sobre o nicho (revisado com evidência):** a semântica original do plano (+1 morte / −1 nascimento) era estruturalmente inerte — mortes/nascimentos em um local alternam estritamente, logo `B ∈ {0,1}` para sempre, `NICH_T = 8` era inalcançável e o bônus S234 nunca disparava (célula viva sempre fica em `B = 0`). A semântica implementada é **cicatriz de morte monotônica** (+1 por morte, sem escrita em nascimento): com `seed=7` a sopa atinge `maxB = 16` na geração 50, com células em bônus desde a geração 30, divergindo do baseline na geração 25 (sonda CPU + teste). Registrado na issue #10.
+
+**Decisão de armazenamento (evidência na issue #10):** MRT RGBA8UI está quebrado no stack de referência (attachment 1 → `GL_INVALID_OPERATION 1286`, fica zerado; mistura RGBA8+RGBA16F também falha). Fallback escolhido: **segundo par ping-pong RGBA8** (`ecoTextures`) + passe `shaders/eco.frag.glsl` que difere `main-read` vs `main-write` para achar nascimentos/mortes (sem duplicar a regra), desenhado **apenas** quando `?energy=1 || ?niche=1`. Inicialização do eco vem da CPU (`fillEcoBuf` a partir dos bits vivos — nunca `readPixels`). `?freq`/`?age` são puramente do shader de sim (sem texturas extras).
+
+**Especialização em tempo de compilação:** branches uniforme *dentro* do loop de vizinhança custavam ~40% do fps @4096² mesmo nunca executados (medido no SwiftShader). O load injeta `#define FREQ/ENERGY/NICHE/AGE` (0/1) após a diretiva `#version` e todo o bloco stage-10 fica sob `#if` — flag off ⇒ código pré-processado embora ⇒ o shader default compila o mesmo caminho da Stage 8. Interpolação default×combo @4096²: 2,47 vs 2,49 gen/s (paridade); A/B contra o HEAD baseline: paridade.
 
 ## Explorador de novidade (Stage 9)
 
@@ -179,8 +204,8 @@ Labels: `stage` (toda issue de etapa), `planned` (planejada/em implementação),
 | 6 — Formato RGBA8UI + modo Conway equivalente | #6 | fechada |
 | 7 — Genoma por célula + herança determinística | #7 | fechada |
 | 8 — Mutação + linhagens + cor | #8 | fechada |
-| 9 — Explorador de novidade (novelty search) | #9 | esta |
-| 10 — Ecologia — seleção, energia, nicho, idade | #10 | aberta |
+| 9 — Explorador de novidade (novelty search) | #9 | fechada |
+| 10 — Ecologia — seleção, energia, nicho, idade | #10 | esta |
 | 11 — Experimentos de regras pouco exploradas | #11 | aberta |
 
 ## Regras do projeto
@@ -191,8 +216,8 @@ Veja [AGENTS.md](./AGENTS.md) — stack fixa (HTML + JS + WebGL2, sem framework/
 
 ```
 index.html        página + toolbar + HUD (sem framework)
-main.js           app WebGL2: context, sim pass, display pass, uploads, controles
-shaders/          sim.vert / sim.frag (genoma + mutação/linhagem) / display.frag
+main.js           app WebGL2: context, sim pass, eco pass, display pass, uploads, controles
+shaders/          sim.vert / sim.frag (genoma + mutação/linhagem + ecologia via #if) / eco.frag (pool+campo) / display.frag
 tools/explore.js  explorador de novidade headless (stage 9)
 tools/gallery/    saída do explorador (gitignorado: run.json, archive.json, achados)
 tests/run.js      harness headless (pnpm test)
