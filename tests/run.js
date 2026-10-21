@@ -440,6 +440,64 @@ function countDiff(a, b) {
   return d;
 }
 
+const popOf = (grid) => { let p = 0; for (let i = 0; i < grid.length; i++) p += grid[i]; return p; };
+const wantFromCoords = (coords, size) => {
+  const g = new Uint8Array(size * size);
+  for (const [x, y] of coords) {
+    g[(((y % size) + size) % size) * size + (((x % size) + size) % size)] = 1;
+  }
+  return g;
+};
+const shifted = (grid, dx, dy) => {
+  const g = new Uint8Array(SIZE * SIZE);
+  for (let y = 0; y < SIZE; y++) {
+    for (let x = 0; x < SIZE; x++) {
+      if (grid[y * SIZE + x]) g[((y + dy) % SIZE) * SIZE + ((x + dx) % SIZE)] = 1;
+    }
+  }
+  return g;
+};
+const CELLS = {
+  lwss: [[1, 0], [2, 0], [3, 0], [4, 0], [0, 1], [4, 1], [4, 2], [0, 3], [3, 3]],
+  mwss: [[2, 0], [0, 1], [4, 1], [5, 2], [0, 3], [5, 3], [1, 4], [2, 4], [3, 4], [4, 4], [5, 4]],
+  pulsar: [
+    [2, 0], [3, 0], [4, 0], [8, 0], [9, 0], [10, 0],
+    [0, 2], [5, 2], [7, 2], [12, 2],
+    [0, 3], [5, 3], [7, 3], [12, 3],
+    [0, 4], [5, 4], [7, 4], [12, 4],
+    [2, 5], [3, 5], [4, 5], [8, 5], [9, 5], [10, 5],
+    [2, 7], [3, 7], [4, 7], [8, 7], [9, 7], [10, 7],
+    [0, 8], [5, 8], [7, 8], [12, 8],
+    [0, 9], [5, 9], [7, 9], [12, 9],
+    [0, 10], [5, 10], [7, 10], [12, 10],
+    [2, 12], [3, 12], [4, 12], [8, 12], [9, 12], [10, 12],
+  ],
+  penta: [
+    [2, 0], [3, 0], [4, 0], [5, 0], [6, 0], [7, 0],
+    [1, 1], [8, 1],
+    [0, 2], [9, 2],
+    [1, 3], [8, 3],
+    [2, 4], [3, 4], [4, 4], [5, 4], [6, 4], [7, 4],
+  ],
+  acorn: [[1, 0], [3, 1], [0, 2], [1, 2], [4, 2], [5, 2], [6, 2]],
+  diehard: [[6, 0], [0, 1], [1, 1], [1, 2], [5, 2], [6, 2], [7, 2]],
+};
+const GUN_CELLS = [
+  [24, 0], [22, 1], [24, 1],
+  [12, 2], [13, 2], [20, 2], [21, 2], [34, 2], [35, 2],
+  [11, 3], [15, 3], [20, 3], [21, 3], [34, 3], [35, 3],
+  [0, 4], [1, 4], [10, 4], [16, 4], [20, 4], [21, 4],
+  [0, 5], [1, 5], [10, 5], [14, 5], [16, 5], [17, 5], [22, 5], [24, 5],
+  [10, 6], [16, 6], [24, 6], [11, 7], [15, 7], [12, 8], [13, 8],
+];
+const SCENE_PARTS = {
+  duel: GUN_CELLS.concat(GUN_CELLS.map(([x, y]) => [83 - x, y])),
+  fleet: GUN_CELLS
+    .concat(CELLS.lwss.map(([x, y]) => [x + 45, y + 12]))
+    .concat(CELLS.lwss.map(([x, y]) => [x + 53, y + 17]))
+    .concat(CELLS.lwss.map(([x, y]) => [x + 45, y + 22])),
+};
+
 const results = [];
 function record(name, pass, detail) {
   results.push({ name, pass, detail });
@@ -1775,50 +1833,6 @@ async function main() {
 
   // ---- Stage 11: pattern library and battle scenes ----
   {
-    const popOf = (grid) => { let p = 0; for (let i = 0; i < grid.length; i++) p += grid[i]; return p; };
-    const wantFromCoords = (coords, size) => {
-      const g = new Uint8Array(size * size);
-      for (const [x, y] of coords) {
-        g[(((y % size) + size) % size) * size + (((x % size) + size) % size)] = 1;
-      }
-      return g;
-    };
-    const shifted = (grid, dx, dy) => {
-      const g = new Uint8Array(SIZE * SIZE);
-      for (let y = 0; y < SIZE; y++) {
-        for (let x = 0; x < SIZE; x++) {
-          if (grid[y * SIZE + x]) g[((y + dy) % SIZE) * SIZE + ((x + dx) % SIZE)] = 1;
-        }
-      }
-      return g;
-    };
-    // Canonical cell lists, independently of main.js (probe-validated, see issue #12 plan).
-    const CELLS = {
-      lwss: [[1, 0], [2, 0], [3, 0], [4, 0], [0, 1], [4, 1], [4, 2], [0, 3], [3, 3]],
-      mwss: [[2, 0], [0, 1], [4, 1], [5, 2], [0, 3], [5, 3], [1, 4], [2, 4], [3, 4], [4, 4], [5, 4]],
-      pulsar: [
-        [2, 0], [3, 0], [4, 0], [8, 0], [9, 0], [10, 0],
-        [0, 2], [5, 2], [7, 2], [12, 2],
-        [0, 3], [5, 3], [7, 3], [12, 3],
-        [0, 4], [5, 4], [7, 4], [12, 4],
-        [2, 5], [3, 5], [4, 5], [8, 5], [9, 5], [10, 5],
-        [2, 7], [3, 7], [4, 7], [8, 7], [9, 7], [10, 7],
-        [0, 8], [5, 8], [7, 8], [12, 8],
-        [0, 9], [5, 9], [7, 9], [12, 9],
-        [0, 10], [5, 10], [7, 10], [12, 10],
-        [2, 12], [3, 12], [4, 12], [8, 12], [9, 12], [10, 12],
-      ],
-      penta: [
-        [2, 0], [3, 0], [4, 0], [5, 0], [6, 0], [7, 0],
-        [1, 1], [8, 1],
-        [0, 2], [9, 2],
-        [1, 3], [8, 3],
-        [2, 4], [3, 4], [4, 4], [5, 4], [6, 4], [7, 4],
-      ],
-      acorn: [[1, 0], [3, 1], [0, 2], [1, 2], [4, 2], [5, 2], [6, 2]],
-      diehard: [[6, 0], [0, 1], [1, 1], [1, 2], [5, 2], [6, 2], [7, 2]],
-    };
-
     const libPage = await browser.newPage({ viewport: { width: 400, height: 300 } });
     const libErrs = [];
     libPage.on('pageerror', (e) => libErrs.push(String(e)));
@@ -1938,21 +1952,6 @@ async function main() {
     }
 
     // scenes on a 128^2 grid: stamp-exact union, GPU==CPU, duel emits gliders
-    const GUN_CELLS = [
-      [24, 0], [22, 1], [24, 1],
-      [12, 2], [13, 2], [20, 2], [21, 2], [34, 2], [35, 2],
-      [11, 3], [15, 3], [20, 3], [21, 3], [34, 3], [35, 3],
-      [0, 4], [1, 4], [10, 4], [16, 4], [20, 4], [21, 4],
-      [0, 5], [1, 5], [10, 5], [14, 5], [16, 5], [17, 5], [22, 5], [24, 5],
-      [10, 6], [16, 6], [24, 6], [11, 7], [15, 7], [12, 8], [13, 8],
-    ];
-    const SCENE_PARTS = {
-      duel: GUN_CELLS.concat(GUN_CELLS.map(([x, y]) => [83 - x, y])),
-      fleet: GUN_CELLS
-        .concat(CELLS.lwss.map(([x, y]) => [x + 45, y + 12]))
-        .concat(CELLS.lwss.map(([x, y]) => [x + 53, y + 17]))
-        .concat(CELLS.lwss.map(([x, y]) => [x + 45, y + 22])),
-    };
     await libPage.goto(`${base}?size=128&sps=0.0001`, { timeout: 60000 });
     await libPage.waitForFunction(() => !!window.__life);
     await libPage.evaluate(() => window.__life.setAuto(false));
@@ -2015,6 +2014,110 @@ async function main() {
     record('stage11: no page errors on the library page',
       libErrs.length === 0, libErrs.join('; ') || undefined);
     await libPage.close();
+  }
+
+  // ---- Stage 12: curated demo mode (?demo=1) ----
+  {
+    const demoErrs = [];
+    const at = (cells, dx, dy) => cells.map(([x, y]) => [x + dx, y + dy]);
+    const demoPage = await browser.newPage({ viewport: { width: 400, height: 300 } });
+    demoPage.on('pageerror', (e) => demoErrs.push(String(e)));
+    await demoPage.goto(`${base}?size=128&sps=0.0001&demo=1`, { timeout: 60000 });
+    await demoPage.waitForFunction(() => !!window.__life);
+    await demoPage.evaluate(() => window.__life.setAuto(false));
+    const demoStep = (n) => demoPage.evaluate((k) => window.__life.step(k), n);
+
+    const g0 = await gpuGrid(demoPage);
+    const wantDuel = wantFromCoords(SCENE_PARTS.duel, 128);
+    const v0 = await demoPage.evaluate(() => window.__life.view());
+    record('stage12: demo phase 0 = duel (72 cells) stamp-exact + fitView camera',
+      countDiff(g0, wantDuel) === 0 && popOf(g0) === 72
+      && v0[0] === 0 && v0[2] === 128 && Math.abs(v0[1] - (64 - v0[3] / 2)) < 1e-9,
+      `pop=${popOf(g0)} view=${JSON.stringify(v0)}`);
+
+    await demoStep(240);
+    const g240 = await gpuGrid(demoPage);
+    const want240 = wantFromCoords(
+      at(SCENE_PARTS.fleet, 3, 3)
+        .concat(at(CELLS.pulsar, 2, 36))
+        .concat(at(CELLS.penta, 45, 2)), 128);
+    record('stage12: phase 1 at gen 240 stamps fleet+pulsar+penta stamp-exact',
+      countDiff(g240, want240) === 0, `pop=${popOf(g240)}`);
+
+    await demoStep(240);
+    const g480 = await gpuGrid(demoPage);
+    const want480 = wantFromCoords(
+      at(CELLS.acorn, 10, 10)
+        .concat(at(CELLS.diehard, 30, 30))
+        .concat(at(CELLS.lwss, 2, 50))
+        .concat(at(CELLS.lwss, 12, 50))
+        .concat(at(CELLS.lwss, 22, 50))
+        .concat(at(CELLS.mwss, 2, 56))
+        .concat(at(CELLS.mwss, 14, 56)), 128);
+    record('stage12: phase 2 at gen 480 stamps methuselahs+parade stamp-exact',
+      countDiff(g480, want480) === 0, `pop=${popOf(g480)}`);
+
+    await demoStep(240);
+    const g720 = await gpuGrid(demoPage);
+    const want720 = wantFromCoords(
+      SCENE_PARTS.duel.concat(at(CELLS.pulsar, 50, 45)), 128);
+    record('stage12: phase 3 at gen 720 stamps duel+pulsar stamp-exact',
+      countDiff(g720, want720) === 0, `pop=${popOf(g720)}`);
+
+    await demoStep(240);
+    const g960 = await gpuGrid(demoPage);
+    const gen960 = await demoPage.evaluate(() => window.__life.generation());
+    record('stage12: demo loops back to phase 0 at gen 960',
+      gen960 === 960 && countDiff(g960, wantDuel) === 0, `gen=${gen960}`);
+
+    const demoPage2 = await browser.newPage({ viewport: { width: 400, height: 300 } });
+    demoPage2.on('pageerror', (e) => demoErrs.push(String(e)));
+    await demoPage2.goto(`${base}?size=128&sps=0.0001&demo=1`, { timeout: 60000 });
+    await demoPage2.waitForFunction(() => !!window.__life);
+    await demoPage2.evaluate(() => window.__life.setAuto(false));
+    await demoPage2.evaluate((k) => window.__life.step(k), 480);
+    const g480b = await gpuGrid(demoPage2);
+    record('stage12: demo deterministic across loads (identical grid at gen 480)',
+      countDiff(g480, g480b) === 0 && countDiff(g480b, wantDuel) !== 0);
+    await demoPage2.close();
+
+    const plainPage = await browser.newPage({ viewport: { width: 400, height: 300 } });
+    plainPage.on('pageerror', (e) => demoErrs.push(String(e)));
+    await plainPage.goto(`${base}?size=${SIZE}&sps=0.0001`, { timeout: 60000 });
+    await plainPage.waitForFunction(() => !!window.__life);
+    await plainPage.evaluate(() => window.__life.setAuto(false));
+    await plainPage.evaluate((k) => window.__life.step(k), 1);
+    const plainG = await gpuGrid(plainPage);
+    record('stage12: without ?demo the grid stays empty (manual mode intact)',
+      popOf(plainG) === 0, `pop=${popOf(plainG)}`);
+    await plainPage.close();
+
+    const hygPage = await browser.newPage({ viewport: { width: 400, height: 300 } });
+    hygPage.on('pageerror', (e) => demoErrs.push(String(e)));
+    await hygPage.addInitScript(() => {
+      window.__counters = { textures: 0, framebuffers: 0, readPixels: 0, drawArrays: 0 };
+      const W2 = WebGL2RenderingContext.prototype;
+      for (const [name, key] of [['createTexture', 'textures'], ['createFramebuffer', 'framebuffers']]) {
+        const orig = W2[name];
+        W2[name] = function () { window.__counters[key]++; return orig.apply(this, arguments); };
+      }
+      const origRead = W2.readPixels;
+      W2.readPixels = function () { window.__counters.readPixels++; return origRead.apply(this, arguments); };
+      const origDraw = W2.drawArrays;
+      W2.drawArrays = function () { window.__counters.drawArrays++; return origDraw.apply(this, arguments); };
+    });
+    await hygPage.goto(`${base}?size=128&sps=120&demo=1`, { timeout: 60000 });
+    await hygPage.waitForFunction(() => !!window.__life);
+    const hygGen0 = await hygPage.evaluate(() => window.__life.generation());
+    await hygPage.waitForTimeout(1500);
+    const hygGen1 = await hygPage.evaluate(() => window.__life.generation());
+    const hyg = await hygPage.evaluate(() => window.__counters);
+    record('stage12: demo hygiene — no readback, stable counters while auto-stepping; no page errors',
+      hygGen1 > hygGen0 && hyg.readPixels === 0 && hyg.textures === 2 && hyg.framebuffers === 2
+      && demoErrs.length === 0,
+      `gen ${hygGen0}->${hygGen1} readPixels=${hyg.readPixels} tex=${hyg.textures} errs=${demoErrs.length}`);
+    await hygPage.close();
+    await demoPage.close();
   }
 
   record(

@@ -24,6 +24,7 @@ Qualquer servidor estático serve (`npx serve`, `php -S`, etc.). Não há build,
 | `?size=2048` | Tamanho do grid (potência de 2, limitado por `min(4096, MAX_TEXTURE_SIZE)`). Padrão: 1024. |
 | `?sps=30` | Gerações por segundo iniciais (1–120 via slider; o parâmetro é o valor de carga). |
 | `?seed=demo` | Estado inicial determinístico (PRNG mulberry32 com seed fixa). `?seed=<n>` usa o inteiro informado. Sem parâmetro: grid vazio. A seed também alimenta o hash de herança/mutação da simulação (mesmo mapeamento do fill: `demo` → constante fixa, ausente → 0, senão o inteiro) — loadings iguais evoluem bit-identicalmente. |
+| `?demo=1` | Modo demo curado (roda sozinho, sem intervenção manual): sequência determinística por geração em ciclo de 960 — gen 0 estampa a cena `Duel of guns`, gen 240 `Fleet vs gun` + Pulsar + Pentadecathlon, gen 480 acorn + diehard + parada de LWSS/MWSS, gen 720 `Duel of guns` + Pulsar, e repete. Cada fase limpa a grade e ajusta a câmera para ver tudo (zoom out); reusa os stamps/buffers existentes (sem alocação nova, sem readback). Compose com `?seed=`: a fase 0 apaga o fill do seed. Recomendado `?demo=1&size=128` (a cena `duel` tem 84 de largura e embrulha no toro em grades menores). `?demo` sem valor liga; ausente ou `?demo=0` desliga. |
 | `?mut=0.05` | Taxa de mutação por nascimento, em fração (0–1; clampado). Padrão: 0 (sem mutação, comportamento Stage 7 bit-exato). Cada nascimento sorteia via hash: com probabilidade `mut` flipa 1 dos 18 bits de regra e o recém-nascido ganha uma linhagem nova (id 1–63). Ver “Mutação e linhagens”. |
 | `?freq=1` | Seleção dependente de frequência (Stage 10). Qualquer valor ≠ `0`/ausente liga; padrão desligado = Conway exato. Ver “Ecologia”. |
 | `?energy=1` | Recurso de energia conservado (Stage 10). Liga a textura de eco + passe `eco.frag`. |
@@ -54,7 +55,7 @@ pnpm install   # só playwright-core, dev-dependency do harness
 pnpm test
 ```
 
-O harness (`tests/run.js`, Playwright + Chromium headless) roda **92 verificações** (os 49 testes originais, intocados, + 3 da Stage 6, + 4 da Stage 7, + 5 da Stage 8, + 4 da Stage 9, + 6 da Stage 10, + 21 da Stage 11) e imprime PASS/FAIL por critério, com exit code ≠ 0 em falha. Ele valida:
+O harness (`tests/run.js`, Playwright + Chromium headless) roda **100 verificações** (os 49 testes originais, intocados, + 3 da Stage 6, + 4 da Stage 7, + 5 da Stage 8, + 4 da Stage 9, + 6 da Stage 10, + 21 da Stage 11, + 8 da Stage 12) e imprime PASS/FAIL por critério, com exit code ≠ 0 em falha. Ele valida:
 
 - **Fidelidade bit-a-bit contra uma referência CPU da B3/S23**: blinker, block, glider (interior e **atravessando a costura do toro**), e Gosper gun por 60 gerações.
 - **Golden do Gosper gun** (valores canônicos, não só CPU-vs-GPU): população **36/41/46** nas gerações 0/30/60 em grid 128², e os offsets exatos dos gliders emitidos (fixados no teste, derivados da referência CPU e conferidos contra as populações canônicas).
@@ -69,6 +70,7 @@ O harness (`tests/run.js`, Playwright + Chromium headless) roda **92 verificaç�
 - **Explorador de novidade (Stage 9):** unitários dos filtros boring (morre/congelou/ruído) e da distância de novelty; determinismo byte-a-byte de `run.json`+`archive.json` entre duas execuções do explorador (mundos still-life em dirs temporários, o archive real nunca é tocado); smoke: still filtrado como frozen, entrada de galeria completa (`reproUrl` no formato certo, métricas numéricas, GIF presente quando ffmpeg existe / `gifSkip` explícito quando não).
 - **Ecologia (Stage 10):** cada mecanismo (`?freq`, `?energy`, `?niche`, `?age`) bit-exato contra a referência CPU com eco (30–300 gerações); conservação: `sum(R+G)` da textura de eco constante a cada geração e igual a `ENERGY_E0 × size²` (init ambiente); nicho: campo atinge riqueza (`B ≥ NICH_T = 48`, ~gen 140) e o bônus S234 diverge do baseline; combo com os quatro flags + `?mut=` bit-exato por 50 gerações (main + eco); e **sem texturas de eco quando `?energy`/`?niche` estão off** (`readEco` retorna `null`, contadores `textures=2`).
 - **Biblioteca de padrões e cenas (Stage 11):** stamp-exact de cada padrão novo (LWSS 9, MWSS 11, pulsar 48, pentadecathlon 18, acorn 7, diehard 7 células) contra listas canônicas independentes; fingerprints canônicos — lwss/mwss p4 deslocando exato **(2,0) por 4 gerações**, pulsar **p3**, pentadecathlon **p15 mínimo**, diehard **extinto exatamente no gen 130** (toro 64, estampa (20,20)) e acorn explodindo (`pop@200 ≥ 100`); paridade GPU vs CPU toroidal em checkpoints (4/40/80; diehard 50/100/130; acorn 50/100/150/200); cenas `duel`/`fleet` stamp-exatas (união sem sobreposição), `duel` emite gliders e ambas bit-exatas vs CPU (grid 128); dropdown completo e stamp via clique DOM.
+- **Modo demo curado (Stage 12):** `?demo=1` em grid 128 — fase 0 (gen 0) = `duel` stamp-exact (72 células) + câmera `fitView`; fases stamp-exact nos gens 240/480/720 (fleet+pulsar+penta; methuselahs+parada; duel+pulsar); ciclo volta ao estado do gen 0 no gen 960; duas loads da mesma URL evoluem byte-idênticas até o gen 480; sem `?demo` o grid permanece vazio no manual (default intacto); higiene: 0 `readPixels` e contadores estáveis com o demo em auto-stepping, sem page errors.
 
 O `readPixels` acontece **exclusivamente fora do stepping automático**: no caminho de validação/teste e no tick de 1 Hz do HUD **somente com a simulação pausada** — nunca em handlers de input nem durante o stepping (comprovado pelo teste de higiene: 0 `readPixels` durante a medição com auto-stepping ligado).
 
@@ -209,7 +211,8 @@ Labels: `stage` (toda issue de etapa), `planned` (planejada/em implementação),
 | 8 — Mutação + linhagens + cor | #8 | fechada |
 | 9 — Explorador de novidade (novelty search) | #9 | fechada |
 | 10 — Ecologia — seleção, energia, nicho, idade | #10 | fechada |
-| 11 — Biblioteca de padrões e cenas de batalha | #12 | esta |
+| 11 — Biblioteca de padrões e cenas de batalha | #12 | fechada |
+| 12 — Modo demo curado (`?demo=1`) | #13 | esta |
 
 ## Regras do projeto
 

@@ -207,6 +207,19 @@ PATTERNS.fleet = composeScene([
   { name: 'lwss', dx: 45, dy: 22 },
 ]);
 
+const DEMO_CYCLE = 960;
+const DEMO_PHASES = [
+  { gen: 0, stamps: [['duel', 0, 0]] },
+  { gen: 240, stamps: [['fleet', 3, 3], ['pulsar', 2, 36], ['penta', 45, 2]] },
+  {
+    gen: 480,
+    stamps: [['acorn', 10, 10], ['diehard', 30, 30],
+      ['lwss', 2, 50], ['lwss', 12, 50], ['lwss', 22, 50],
+      ['mwss', 2, 56], ['mwss', 14, 56]],
+  },
+  { gen: 720, stamps: [['duel', 0, 0], ['pulsar', 50, 45]] },
+];
+
 const MAX_STEPS_PER_FRAME = 8;
 // Stage 10: initial cell energy (eco R channel) when ?energy=1. Mirrored in
 // tests/run.js ENERGY_E0 and the ENERGY_B_MIN gate in sim.frag.glsl.
@@ -241,6 +254,8 @@ async function main() {
   const ecoNiche = flagOn('niche') ? 1 : 0;
   const ecoAge = flagOn('age') ? 1 : 0;
   const ecoOn = (ecoEnergy || ecoNiche) ? 1 : 0;
+  const demoOn = flagOn('demo');
+  let demoIdx = 0;
   const simDefines = '#define FREQ ' + ecoFreq + '\n'
     + '#define ENERGY ' + ecoEnergy + '\n'
     + '#define NICHE ' + ecoNiche + '\n'
@@ -452,6 +467,10 @@ async function main() {
     read = write;
     write ^= 1;
     generation++;
+    if (demoOn && generation % DEMO_CYCLE === DEMO_PHASES[demoIdx].gen) {
+      applyDemoPhase(demoIdx);
+      demoIdx = (demoIdx + 1) % DEMO_PHASES.length;
+    }
   }
 
   function display() {
@@ -568,6 +587,16 @@ async function main() {
     uploadPatch(0, 0, size, size, fullBuf);
     fillEcoBuf((i) => fullBuf[i * 4] & 1);
     uploadEco(ecoBuf);
+  }
+
+  function applyDemoPhase(i) {
+    const phase = DEMO_PHASES[i];
+    clearGrid();
+    for (const stamp of phase.stamps) {
+      stampPattern(stamp[0], stamp[1], stamp[2]);
+    }
+    fitView();
+    userInteracted = 1;
   }
 
   function initSeed() {
@@ -821,6 +850,10 @@ async function main() {
   fitView();
   resize();
   initSeed();
+  if (demoOn) {
+    applyDemoPhase(0);
+    demoIdx = 1;
+  }
 
   function frame(now) {
     if (lastTime < 0) lastTime = now;
