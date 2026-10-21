@@ -123,9 +123,90 @@ const PATTERNS = {
     [11, 7], [15, 7],
     [12, 8], [13, 8],
   ]),
+  lwss: makePattern(5, 4, [
+    [1, 0], [2, 0], [3, 0], [4, 0],
+    [0, 1], [4, 1],
+    [4, 2],
+    [0, 3], [3, 3],
+  ]),
+  mwss: makePattern(6, 5, [
+    [2, 0],
+    [0, 1], [4, 1],
+    [5, 2],
+    [0, 3], [5, 3],
+    [1, 4], [2, 4], [3, 4], [4, 4], [5, 4],
+  ]),
+  pulsar: makePattern(13, 13, [
+    [2, 0], [3, 0], [4, 0], [8, 0], [9, 0], [10, 0],
+    [0, 2], [5, 2], [7, 2], [12, 2],
+    [0, 3], [5, 3], [7, 3], [12, 3],
+    [0, 4], [5, 4], [7, 4], [12, 4],
+    [2, 5], [3, 5], [4, 5], [8, 5], [9, 5], [10, 5],
+    [2, 7], [3, 7], [4, 7], [8, 7], [9, 7], [10, 7],
+    [0, 8], [5, 8], [7, 8], [12, 8],
+    [0, 9], [5, 9], [7, 9], [12, 9],
+    [0, 10], [5, 10], [7, 10], [12, 10],
+    [2, 12], [3, 12], [4, 12], [8, 12], [9, 12], [10, 12],
+  ]),
+  penta: makePattern(10, 5, [
+    [2, 0], [3, 0], [4, 0], [5, 0], [6, 0], [7, 0],
+    [1, 1], [8, 1],
+    [0, 2], [9, 2],
+    [1, 3], [8, 3],
+    [2, 4], [3, 4], [4, 4], [5, 4], [6, 4], [7, 4],
+  ]),
+  acorn: makePattern(7, 3, [
+    [1, 0],
+    [3, 1],
+    [0, 2], [1, 2], [4, 2], [5, 2], [6, 2],
+  ]),
+  diehard: makePattern(8, 3, [
+    [6, 0],
+    [0, 1], [1, 1],
+    [1, 2], [5, 2], [6, 2], [7, 2],
+  ]),
 };
 
 const MAX_BRUSH_SIDE = 65;
+
+function composeScene(parts) {
+  let w = 0;
+  let h = 0;
+  for (const part of parts) {
+    const src = PATTERNS[part.name];
+    w = Math.max(w, part.dx + src.w);
+    h = Math.max(h, part.dy + src.h);
+  }
+  if (w * h > MAX_BRUSH_SIDE * MAX_BRUSH_SIDE) {
+    throw new Error('scene too large for patchBuf: ' + w + 'x' + h);
+  }
+  const bits = new Uint8Array(w * h);
+  for (const part of parts) {
+    const src = PATTERNS[part.name];
+    for (let y = 0; y < src.h; y++) {
+      for (let x = 0; x < src.w; x++) {
+        if (!src.bits[y * src.w + x]) continue;
+        const sx = part.flipX ? src.w - 1 - x : x;
+        const i = (part.dy + y) * w + (part.dx + sx);
+        if (bits[i]) throw new Error('scene parts overlap at ' + i);
+        bits[i] = 1;
+      }
+    }
+  }
+  return { w: w, h: h, bits: bits };
+}
+
+PATTERNS.duel = composeScene([
+  { name: 'gun', dx: 0, dy: 0 },
+  { name: 'gun', dx: 48, dy: 0, flipX: true },
+]);
+PATTERNS.fleet = composeScene([
+  { name: 'gun', dx: 0, dy: 0 },
+  { name: 'lwss', dx: 45, dy: 12 },
+  { name: 'lwss', dx: 53, dy: 17 },
+  { name: 'lwss', dx: 45, dy: 22 },
+]);
+
 const MAX_STEPS_PER_FRAME = 8;
 // Stage 10: initial cell energy (eco R channel) when ?energy=1. Mirrored in
 // tests/run.js ENERGY_E0 and the ENERGY_B_MIN gate in sim.frag.glsl.

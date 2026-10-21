@@ -1773,6 +1773,250 @@ async function main() {
     }
   }
 
+  // ---- Stage 11: pattern library and battle scenes ----
+  {
+    const popOf = (grid) => { let p = 0; for (let i = 0; i < grid.length; i++) p += grid[i]; return p; };
+    const wantFromCoords = (coords, size) => {
+      const g = new Uint8Array(size * size);
+      for (const [x, y] of coords) {
+        g[(((y % size) + size) % size) * size + (((x % size) + size) % size)] = 1;
+      }
+      return g;
+    };
+    const shifted = (grid, dx, dy) => {
+      const g = new Uint8Array(SIZE * SIZE);
+      for (let y = 0; y < SIZE; y++) {
+        for (let x = 0; x < SIZE; x++) {
+          if (grid[y * SIZE + x]) g[((y + dy) % SIZE) * SIZE + ((x + dx) % SIZE)] = 1;
+        }
+      }
+      return g;
+    };
+    // Canonical cell lists, independently of main.js (probe-validated, see issue #12 plan).
+    const CELLS = {
+      lwss: [[1, 0], [2, 0], [3, 0], [4, 0], [0, 1], [4, 1], [4, 2], [0, 3], [3, 3]],
+      mwss: [[2, 0], [0, 1], [4, 1], [5, 2], [0, 3], [5, 3], [1, 4], [2, 4], [3, 4], [4, 4], [5, 4]],
+      pulsar: [
+        [2, 0], [3, 0], [4, 0], [8, 0], [9, 0], [10, 0],
+        [0, 2], [5, 2], [7, 2], [12, 2],
+        [0, 3], [5, 3], [7, 3], [12, 3],
+        [0, 4], [5, 4], [7, 4], [12, 4],
+        [2, 5], [3, 5], [4, 5], [8, 5], [9, 5], [10, 5],
+        [2, 7], [3, 7], [4, 7], [8, 7], [9, 7], [10, 7],
+        [0, 8], [5, 8], [7, 8], [12, 8],
+        [0, 9], [5, 9], [7, 9], [12, 9],
+        [0, 10], [5, 10], [7, 10], [12, 10],
+        [2, 12], [3, 12], [4, 12], [8, 12], [9, 12], [10, 12],
+      ],
+      penta: [
+        [2, 0], [3, 0], [4, 0], [5, 0], [6, 0], [7, 0],
+        [1, 1], [8, 1],
+        [0, 2], [9, 2],
+        [1, 3], [8, 3],
+        [2, 4], [3, 4], [4, 4], [5, 4], [6, 4], [7, 4],
+      ],
+      acorn: [[1, 0], [3, 1], [0, 2], [1, 2], [4, 2], [5, 2], [6, 2]],
+      diehard: [[6, 0], [0, 1], [1, 1], [1, 2], [5, 2], [6, 2], [7, 2]],
+    };
+
+    const libPage = await browser.newPage({ viewport: { width: 400, height: 300 } });
+    const libErrs = [];
+    libPage.on('pageerror', (e) => libErrs.push(String(e)));
+    await libPage.goto(`${base}?size=${SIZE}&sps=0.0001`, { timeout: 60000 });
+    await libPage.waitForFunction(() => !!window.__life);
+    await libPage.evaluate(() => window.__life.setAuto(false));
+    const libStep = (n) => libPage.evaluate((k) => window.__life.step(k), n);
+    const libClearStamp = (name, x, y) => libPage.evaluate(([n, px, py]) => {
+      window.__life.clear();
+      window.__life.stampPattern(n, px, py);
+    }, [name, x, y]);
+
+    // stamp-exact for each library pattern vs the independent canonical list
+    for (const [name, cells] of Object.entries(CELLS)) {
+      await libClearStamp(name, 20, 20);
+      const got = await gpuGrid(libPage);
+      const want = wantFromCoords(cells.map(([x, y]) => [x + 20, y + 20]), SIZE);
+      record(`stage11: ${name} stamped exactly (${cells.length} cells)`,
+        countDiff(got, want) === 0);
+    }
+
+    // lwss/mwss: p4 spaceships with exact +(2,0) displacement per 4 generations
+    for (const name of ['lwss', 'mwss']) {
+      await libClearStamp(name, 20, 20);
+      const s0 = await gpuGrid(libPage);
+      await libStep(4);
+      const s4 = await gpuGrid(libPage);
+      record(`stage11: ${name} moves exactly (2,0) per 4 gens (p4)`,
+        popOf(s0) === CELLS[name].length && countDiff(s4, shifted(s0, 2, 0)) === 0);
+    }
+
+    // pulsar: period 3, 48 cells, gen1 distinct with canonical pop 56
+    {
+      await libClearStamp('pulsar', 20, 20);
+      const p0 = await gpuGrid(libPage);
+      await libStep(1);
+      const p1 = await gpuGrid(libPage);
+      await libStep(2);
+      const p3 = await gpuGrid(libPage);
+      record('stage11: pulsar is p3 (48 cells, pop@1=56)',
+        popOf(p0) === 48 && popOf(p1) === 56
+        && countDiff(p1, p0) !== 0 && countDiff(p3, p0) === 0);
+    }
+
+    // pentadecathlon: minimal period 15 from the canonical ring phase
+    {
+      await libClearStamp('penta', 20, 20);
+      const e0 = await gpuGrid(libPage);
+      let minimal = true;
+      for (let k = 1; k <= 14; k++) {
+        await libStep(1);
+        const ek = await gpuGrid(libPage);
+        if (countDiff(ek, e0) === 0) minimal = false;
+      }
+      await libStep(1);
+      const e15 = await gpuGrid(libPage);
+      record('stage11: pentadecathlon is minimal p15 (18 cells)',
+        popOf(e0) === 18 && minimal && countDiff(e15, e0) === 0);
+    }
+
+    // diehard: extinct exactly at gen 130 on 64^2 stamped at (20,20); GPU==CPU
+    {
+      await libClearStamp('diehard', 20, 20);
+      const d0 = await gpuGrid(libPage);
+      let ref = Uint8Array.from(d0);
+      let exact = true;
+      let pop100 = -1;
+      for (let g = 1; g <= 130; g++) {
+        ref = cpuStep(ref, SIZE);
+        await libStep(1);
+        if (g === 50 || g === 100 || g === 130) {
+          const got = await gpuGrid(libPage);
+          if (countDiff(ref, got) !== 0) exact = false;
+          if (g === 100) pop100 = popOf(got);
+        }
+      }
+      const d130 = await gpuGrid(libPage);
+      record('stage11: diehard extinct exactly at gen 130; GPU==CPU at 50/100/130',
+        popOf(d0) === 7 && pop100 > 0 && popOf(d130) === 0 && exact,
+        `pop@100=${pop100} pop@130=${popOf(d130)}`);
+    }
+
+    // acorn: methuselah explodes; GPU==CPU at 50/100/150/200; pop@200 >= 100
+    {
+      await libClearStamp('acorn', 20, 20);
+      const a0 = await gpuGrid(libPage);
+      let ref = Uint8Array.from(a0);
+      let exact = true;
+      for (let g = 1; g <= 200; g++) {
+        ref = cpuStep(ref, SIZE);
+        await libStep(1);
+        if (g === 50 || g === 100 || g === 150 || g === 200) {
+          const got = await gpuGrid(libPage);
+          if (countDiff(ref, got) !== 0) exact = false;
+        }
+      }
+      const a200 = await gpuGrid(libPage);
+      record('stage11: acorn explodes; GPU==CPU at 50/100/150/200',
+        popOf(a0) === 7 && exact && popOf(a200) >= 100, `pop@200=${popOf(a200)}`);
+    }
+
+    // GPU vs CPU toroidal parity for the remaining patterns at 4/40/80
+    for (const name of ['lwss', 'mwss', 'pulsar', 'penta']) {
+      await libClearStamp(name, 20, 20);
+      const g0 = await gpuGrid(libPage);
+      let ref = Uint8Array.from(g0);
+      let exact = true;
+      for (let g = 1; g <= 80; g++) {
+        ref = cpuStep(ref, SIZE);
+        await libStep(1);
+        if (g === 4 || g === 40 || g === 80) {
+          const got = await gpuGrid(libPage);
+          if (countDiff(ref, got) !== 0) exact = false;
+        }
+      }
+      record(`stage11: ${name} GPU==CPU toroidal at gens 4/40/80`, exact);
+    }
+
+    // scenes on a 128^2 grid: stamp-exact union, GPU==CPU, duel emits gliders
+    const GUN_CELLS = [
+      [24, 0], [22, 1], [24, 1],
+      [12, 2], [13, 2], [20, 2], [21, 2], [34, 2], [35, 2],
+      [11, 3], [15, 3], [20, 3], [21, 3], [34, 3], [35, 3],
+      [0, 4], [1, 4], [10, 4], [16, 4], [20, 4], [21, 4],
+      [0, 5], [1, 5], [10, 5], [14, 5], [16, 5], [17, 5], [22, 5], [24, 5],
+      [10, 6], [16, 6], [24, 6], [11, 7], [15, 7], [12, 8], [13, 8],
+    ];
+    const SCENE_PARTS = {
+      duel: GUN_CELLS.concat(GUN_CELLS.map(([x, y]) => [83 - x, y])),
+      fleet: GUN_CELLS
+        .concat(CELLS.lwss.map(([x, y]) => [x + 45, y + 12]))
+        .concat(CELLS.lwss.map(([x, y]) => [x + 53, y + 17]))
+        .concat(CELLS.lwss.map(([x, y]) => [x + 45, y + 22])),
+    };
+    await libPage.goto(`${base}?size=128&sps=0.0001`, { timeout: 60000 });
+    await libPage.waitForFunction(() => !!window.__life);
+    await libPage.evaluate(() => window.__life.setAuto(false));
+    for (const [name, cells] of Object.entries(SCENE_PARTS)) {
+      await libClearStamp(name, 10, 10);
+      const g0 = await gpuGrid(libPage);
+      const want = wantFromCoords(cells.map(([x, y]) => [x + 10, y + 10]), 128);
+      let ref = Uint8Array.from(g0);
+      let exact = true;
+      for (let g = 1; g <= 80; g++) {
+        ref = cpuStep(ref, 128);
+        await libStep(1);
+        if (g === 40 || g === 80) {
+          const got = await gpuGrid(libPage);
+          if (countDiff(ref, got) !== 0) exact = false;
+        }
+      }
+      const g80 = await gpuGrid(libPage);
+      if (name === 'duel') {
+        record('stage11: duel stamp-exact (72 cells), GPU==CPU 40/80, emits gliders',
+          countDiff(g0, want) === 0 && exact && popOf(g80) > popOf(g0),
+          `pop@0=${popOf(g0)} pop@80=${popOf(g80)}`);
+      } else {
+        record('stage11: fleet stamp-exact (63 cells), GPU==CPU 40/80',
+          countDiff(g0, want) === 0 && exact,
+          `pop@0=${popOf(g0)} pop@80=${popOf(g80)}`);
+      }
+    }
+
+    // toolbar: dropdown lists every library option; DOM click stamps pulsar exactly
+    await libPage.goto(`${base}?size=${SIZE}&sps=0.0001`, { timeout: 60000 });
+    await libPage.waitForFunction(() => !!window.__life);
+    await libPage.evaluate(() => window.__life.setAuto(false));
+    const libOpts = await libPage.evaluate(() =>
+      Array.from(document.getElementById('pattern').options).map((o) => o.value));
+    record('stage11: pattern dropdown lists all library options',
+      ['brush', 'glider', 'blinker', 'gun', 'lwss', 'mwss', 'pulsar', 'penta',
+        'acorn', 'diehard', 'duel', 'fleet'].every((v) => libOpts.includes(v)),
+      JSON.stringify(libOpts));
+    await libPage.click('#btn-clear');
+    await libPage.selectOption('#pattern', 'pulsar');
+    await libPage.click('#btn-paint');
+    const libExpectedTexel = (mx, my) => libPage.evaluate(([x, y]) => {
+      const c = document.querySelector('canvas');
+      const v = window.__life.view();
+      return [Math.floor(v[0] + (x / c.clientWidth) * v[2]), Math.floor(v[1] + (1 - y / c.clientHeight) * v[3])];
+    }, [mx, my]);
+    const libPos = [200, 150];
+    const libTex = await libExpectedTexel(libPos[0], libPos[1]);
+    await libPage.mouse.move(libPos[0], libPos[1]);
+    await libPage.mouse.down();
+    await libPage.mouse.up();
+    const domGrid = await gpuGrid(libPage);
+    const domWant = wantFromCoords(CELLS.pulsar.map(([x, y]) => [libTex[0] + x, libTex[1] + y]), SIZE);
+    record('stage11: pattern stamp via toolbar (DOM, pulsar)',
+      countDiff(domGrid, domWant) === 0, `texel=(${libTex[0]},${libTex[1]})`);
+    await libPage.selectOption('#pattern', 'brush');
+    await libPage.click('#btn-paint');
+
+    record('stage11: no page errors on the library page',
+      libErrs.length === 0, libErrs.join('; ') || undefined);
+    await libPage.close();
+  }
+
   record(
     'no page errors or console errors across the whole run',
     pageErrors.length === 0 && !console_.some((m) => m.startsWith('[error]')),
