@@ -216,17 +216,20 @@ function cpuStepGenomeMut(state, size, gen, seed, mutBp) {
 }
 
 // Stage 10: constants mirrored from sim.frag.glsl / eco.frag.glsl / main.js.
+// Stage 13 (#14): AGE ramp gentler (evidence: stage-10 ramp starved worlds
+// past ~1800 gens); NICHE_DECAY_T = new scar-decay period in eco.frag.
 const ECO = {
   FREQ_SIM_DIST: 4,
   FREQ_PENALTY_T: 4,
   ENERGY_E0: 8,
   ENERGY_B_MIN: 4,
   NICH_T: 48,
+  NICHE_DECAY_T: 8,
   GIVE_T: 8,
   RCV_T: 4,
   AGE_Y_MIN: 1,
-  AGE_DEATH_START: 96,
-  AGE_DEATH_STEP_BP: 200,
+  AGE_DEATH_START: 127,
+  AGE_DEATH_STEP_BP: 10,
 };
 
 function popcount18(v) {
@@ -242,8 +245,9 @@ function popcount18(v) {
 // Stage 10: CPU reference for the ecology flags — sim pass mirrors sim.frag
 // (freq/age/niche/energy branches + mutation), eco pass mirrors eco.frag
 // (births/deaths diffed from old/new main, pool split/merge, spatial flow
-// GIVE_T->RCV_T rich->poor flow on pre-event values; niche B is a monotone
-// +1 on death, no birth write — see eco.frag header).
+// GIVE_T->RCV_T rich->poor flow on pre-event values; niche B is +1 on death
+// with no birth write, and since stage 13 decays 1 per NICHE_DECAY_T no-death
+// gens via the eco A-channel timer — see eco.frag header).
 // opts = { freq, energy, niche, age, mutBp }; returns { state, eco }.
 function cpuStepEco(state, eco, size, gen, seed, opts) {
   const freq = opts.freq ? 1 : 0;
@@ -361,8 +365,10 @@ function cpuStepEco(state, eco, size, gen, seed, opts) {
     let er = eco[si];
     let eg = eco[si + 1];
     let eb = eco[si + 2];
+    let ea = eco[si + 3];
     const gPre = eco[si + 1];
     const bornSelf = !oldAlive && newAlive;
+    const diedSelf = oldAlive && !newAlive;
     if (!oldAlive && newAlive) {
       const part = eg >> 1;
       er = part;
@@ -398,10 +404,20 @@ function cpuStepEco(state, eco, size, gen, seed, opts) {
       }
     }
     eg = eg + flow;
+    // Niche scar decay timer (stage 13, mirrors eco.frag): death resets,
+    // quiescence decays B by 1 every NICHE_DECAY_T generations.
+    if (diedSelf) {
+      ea = 0;
+    } else if (ea >= ECO.NICHE_DECAY_T) {
+      eb = eb > 0 ? eb - 1 : 0;
+      ea = 0;
+    } else {
+      ea = ea + 1;
+    }
     nextEco[si] = er;
     nextEco[si + 1] = eg;
     nextEco[si + 2] = eb;
-    nextEco[si + 3] = 0;
+    nextEco[si + 3] = ea;
   }
   return { state: next, eco: nextEco };
 }
@@ -2118,6 +2134,114 @@ async function main() {
       `gen ${hygGen0}->${hygGen1} readPixels=${hyg.readPixels} tex=${hyg.textures} errs=${demoErrs.length}`);
     await hygPage.close();
     await demoPage.close();
+  }
+
+  // ---- Stage 13: long-horizon ecology stability (3000 gens, mut=0) ----
+  // Probe per issue #14: with eco flags at real speed (3000+ gens in minutes),
+  // no flag combination may go to total extinction nor freeze (screen full /
+  // stopped). Metrics at checkpoints 2000..3000 (step 100), readback only at
+  // checkpoints (batched __life.step(k), explore.js precedent):
+  //   (a) pop >= 1% of the grid sustained, (b) density in [1% floor, 0.80],
+  //   (c) no pinned crystal: NOT (final-window density >= 0.35 AND relative
+  //       pop range < 1%), (d) sum(R+G) constant where eco exists.
+  // Calibration (evidence on #14, pre-fix run): sparse Conway settling under
+  // freq/energy is benign B3/S23 physics, not the issue's "fill the screen
+  // and stop" freeze — so (c) requires BOTH high density AND pinned pop.
+  {
+    const s13Errs = [];
+    const s13Page = await browser.newPage({ viewport: { width: 400, height: 300 } });
+    s13Page.on('pageerror', (e) => s13Errs.push(String(e)));
+    const CHECKS = [];
+    for (let t = 2000; t <= 3000; t += 100) CHECKS.push(t);
+    const POP_MIN = Math.ceil(0.01 * 64 * 64);
+    const DENS_LO = POP_MIN / 4096; // same 1% bound as the pop floor (the
+    // plan's [0.02, 0.8] band made the lower bound stricter (82 cells) than
+    // the pop floor (41) — calibrated per the plan's evidence provision)
+    const DENS_HI = 0.80;
+    const CRYSTAL_DENS = 0.35;
+    const PIN_MIN = 0.01;
+    const CFGS = [
+      ['freq', { freq: '1' }],
+      ['energy', { energy: '1' }],
+      ['niche', { niche: '1' }],
+      ['age', { age: '1' }],
+      ['combo', { freq: '1', energy: '1', niche: '1', age: '1' }],
+    ];
+    const readRaw64s13 = () => s13Page.evaluate(() => Array.from(window.__life.readRaw(0, 0, 64, 64)));
+    const readEcoS13 = () => s13Page.evaluate(() => {
+      const b = window.__life.readEco();
+      return b ? Array.from(b) : null;
+    });
+    const popOfRaw = (raw) => {
+      let p = 0;
+      for (let i = 0; i < raw.length; i += 4) if (raw[i] & 1) p++;
+      return p;
+    };
+    for (const [name, flags] of CFGS) {
+      const q = new URLSearchParams({ size: '64', sps: '0.0001', seed: '7' });
+      for (const [k, v] of Object.entries(flags)) q.set(k, v);
+      await s13Page.goto(`${base}?${q}`, { timeout: 60000 });
+      await s13Page.waitForFunction(() => !!window.__life || !!document.getElementById('error'));
+      await s13Page.evaluate(() => {
+        window.__life.setAuto(false);
+        window.__life.setGenome('conway');
+        window.__life.clear();
+        for (let y = 0; y < 64; y++) {
+          for (let x = 0; x < 64; x++) {
+            const left = x < 32;
+            const alive = left ? ((x * 3 + y * 5) % 7 < 3) : ((x * 5 + y * 3) % 11 < 4);
+            if (alive) {
+              window.__life.setGenome(left ? 'conway' : 'highlife');
+              window.__life.stampBrush(x, y, 0);
+            }
+          }
+        }
+        window.__life.setGenome('conway');
+      });
+      const e0raw = await readEcoS13();
+      let sum0 = 0;
+      if (e0raw) for (let i = 0; i < e0raw.length; i += 4) sum0 += e0raw[i] + e0raw[i + 1];
+      let cur = 0;
+      let minPop = Infinity;
+      let maxPop = 0;
+      let maxDens = 0;
+      let minDens = 1;
+      let consOk = true;
+      const diag = [];
+      for (const t of CHECKS) {
+        if (t - cur > 0) {
+          await s13Page.evaluate((k) => window.__life.step(k), t - cur);
+          cur = t;
+        }
+        const a = await readRaw64s13();
+        const pop = popOfRaw(a);
+        const dens = pop / 4096;
+        if (pop < minPop) minPop = pop;
+        if (pop > maxPop) maxPop = pop;
+        if (dens > maxDens) maxDens = dens;
+        if (dens < minDens) minDens = dens;
+        let sum = -1;
+        if (e0raw) {
+          const e = await readEcoS13();
+          sum = 0;
+          for (let i = 0; i < e.length; i += 4) sum += e[i] + e[i + 1];
+          if (sum !== sum0) consOk = false;
+        }
+        await s13Page.evaluate(() => window.__life.step(10));
+        cur += 10;
+        diag.push(`${t}:${pop}${sum >= 0 ? '/' + sum : ''}`);
+      }
+      const relRange = maxPop > 0 ? (maxPop - minPop) / maxPop : 0;
+      const pinnedCrystal = maxDens >= CRYSTAL_DENS && relRange < PIN_MIN;
+      const ok = minPop >= POP_MIN && minDens >= DENS_LO && maxDens <= DENS_HI
+        && !pinnedCrystal && consOk;
+      record(`stage13: ${name} @3000 (mut=0, seed=7): pop>=${POP_MIN}, dens[${DENS_LO},${DENS_HI}], no pinned crystal${e0raw ? ', conserved' : ''}`,
+        ok,
+        `minPop=${minPop} dens=[${minDens.toFixed(3)},${maxDens.toFixed(3)}] relRange=${relRange.toFixed(4)} crystal=${pinnedCrystal} cons=${consOk} ckpts=${diag.join(' ')}`);
+    }
+    record('stage13: no page errors across the long-horizon probes',
+      s13Errs.length === 0, s13Errs.join('; ') || undefined);
+    await s13Page.close();
   }
 
   record(

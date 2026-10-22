@@ -31,6 +31,16 @@
 // actually reaches richness. Constants stay adjustable; recorded on #10.)
 // R+G per texel moves only between cells and pools, and flow moves G between
 // texels without creating any => exact global energy conservation.
+// Niche scar decay (stage 13, issue #14): the stage-10 scar was monotone —
+// saturation pinned the whole grid at B >= NICH_T and the S234 bonus froze
+// the world at ~50% density beyond ~600-1500 gens (evidence on #14). The eco
+// A channel (written 0.0, never read before) is now a per-texel timer: reset
+// to 0 on death, +1 every generation without a death; at NICHE_DECAY_T the
+// scar decays 1 (B = max(0, B-1)) and the timer restarts. Death sites churn
+// (timer rarely reaches the period -> scars survive where the world is
+// alive), quiescent sites bleed back below NICH_T -> the S234 bonus retreats
+// from frozen ground. Asymmetric on purpose: no birth write, so the +1/-1
+// {0,1} inertness trap documented above cannot re-form. R+G untouched.
 // Drawn only when ?energy=1 || ?niche=1 (eco textures exist only then).
 precision highp float;
 uniform sampler2D uMainOld;
@@ -42,6 +52,7 @@ out vec4 outEco;
 
 const int GIVE_T = 8;  // giver threshold (mirrored: tests/run.js ECO)
 const int RCV_T = 4;   // receiver threshold (mirrored: ECO; B_MIN = RCV_T)
+const int NICHE_DECAY_T = 8;  // scar decay period in no-death gens (mirrored)
 
 int byteOf(float f) { return int(f * 255.0 + 0.5); }
 
@@ -53,6 +64,7 @@ void main() {
   int r = byteOf(eco.r);
   int gPre = byteOf(eco.g);
   int b = byteOf(eco.b);
+  int aT = byteOf(eco.a);
   bool born = oldAlive == 0 && newAlive == 1;
   bool died = oldAlive == 1 && newAlive == 0;
   // Event on this texel's own pre-event pool.
@@ -92,5 +104,14 @@ void main() {
     }
   }
   g = g + flow;
-  outEco = vec4(float(r) / 255.0, float(g) / 255.0, float(b) / 255.0, 0.0);
+  // Niche scar decay timer (stage 13): death resets, quiescence decays.
+  if (died) {
+    aT = 0;
+  } else if (aT >= NICHE_DECAY_T) {
+    b = b > 0 ? b - 1 : 0;
+    aT = 0;
+  } else {
+    aT = aT + 1;
+  }
+  outEco = vec4(float(r) / 255.0, float(g) / 255.0, float(b) / 255.0, float(aT) / 255.0);
 }

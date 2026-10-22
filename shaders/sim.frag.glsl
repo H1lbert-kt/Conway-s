@@ -61,9 +61,17 @@ const int ENERGY_B_MIN = 4;
 const int NICH_T = 48;
 #endif
 #if AGE == 1
+// Stage 13 (issue #14): elder culling only at the age cap — the stage-10 ramp
+// (start 96, 200bp) starved sparse worlds past ~1800 gens (probe evidence:
+// attrition without enough births to replace). Age saturates at 127, so this
+// is a flat 0.1%/gen death chance for max-age cells: the lifecycle keeps
+// injecting vacancies/churn but can no longer drain a settled world (offline
+// CPU-ref scan, validated bit-exact vs GPU to gen 1000: equilibrium ~62-71
+// cells sustained at 3000-4000 gens, vs 1114 frozen cells all-off).
+// AGE_Y_MIN donor veto unchanged.
 const int AGE_Y_MIN = 1;
-const int AGE_DEATH_START = 96;
-const int AGE_DEATH_STEP_BP = 200;
+const int AGE_DEATH_START = 127;
+const int AGE_DEATH_STEP_BP = 10;
 #endif
 
 int byteOf(float f) { return int(f * 255.0 + 0.5); }
