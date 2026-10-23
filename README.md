@@ -4,7 +4,7 @@ Simulação do Jogo da Vida de Conway (B3/S23) no navegador, feita para rodar **
 
 ![Gosper glider gun rodando com HUD de fps/gen por segundo](assets/demo.gif)
 
-![Screenshot: toolbar, gun emitindo gliders e HUD](assets/screenshot.png)
+![Screenshot: toolbar, duelo de dois canhões trocando gliders e HUD](assets/screenshot.png)
 
 ## Rodando localmente
 
@@ -60,6 +60,52 @@ Qualquer servidor estático serve (`npx serve`, `php -S`, etc.). Não há build,
 | `?energy=1&niche=1&age=1&freq=1` | Ecologia completa (combo dos quatro mecanismos da Stage 10). |
 | `node tools/explore.js --size 64 --gens 120 --worlds 8 --mut 0.05 --exp physics` | Explorador de novidade headless: filtra mundos chatos e arquiva os interessantes com GIF + link de reprodução. |
 | `pnpm test` | A suíte inteira (117 verificações, ~10–15 min em SwiftShader). |
+
+## Galeria
+
+Todas capturadas do app rodando de verdade (Chromium headless + SwiftShader), via hooks de validação — o mesmo caminho dos testes.
+
+### Padrões e cenas de batalha
+
+Biblioteca completa da Stage 11, stamp-exact no gen 0 (esquerda→direita, cima→baixo): Gosper gun, pulsar (p3), pentadecathlon (p15), glider, blinker, LWSS, MWSS, acorn, diehard; no meio, a cena `fleet` (esquadra de LWSS contra um canhão).
+
+![Biblioteca de padrões e cena fleet](assets/patterns.png)
+
+O canhão clássico disparando gliders (30 gerações por tiro):
+
+![Gosper gun emitindo gliders](assets/gun.gif)
+
+Duelo de canhões: dois Gosper guns frontalmente, gliders cruzando no meio (cena `duel`, usada no demo):
+
+![Duel of guns](assets/duel.gif)
+
+Esquadra de LWSS em formação contra um canhão (cena `fleet`):
+
+![Fleet vs gun](assets/fleet.gif)
+
+Methuselah: acorn — 7 células que explodem em ~700 vivas e estabilizam só depois da geração 633:
+
+![Acorn explodindo](assets/acorn.gif)
+
+### Ecologia e mutação
+
+Com `?seed=7&mut=0.05` após 100 gerações: cada cor é uma linhagem (Stage 8); a sopa vira um arquipélago de variantes competindo (seleção por frequência e ciclo de vida desligados aqui — só mutação):
+
+![Linhagens coloridas por mutação](assets/lineages.png)
+
+### Experimentos de regras (Stage 14)
+
+Border — mesmo estímulo de 6 vizinhos nos dois lados da costura; só o lado HighLife (B6) nasce no gen 1:
+
+![Border: nascimento só no lado B6](assets/border.png)
+
+Virus — contágio de regra (linhagem 63, magenta) avançando ~1 célula/gen pela sopa suscetível até bater na zona imune pesada (à direita):
+
+![Virus: frente de contágio até a zona imune](assets/virus.gif)
+
+Physics — o mundo controla a própria física: sopa 50/50 Conway/pesada, a massa média de regra sobe e estabiliza a dinâmica:
+
+![Physics: world-controlled rule mass](assets/physics.gif)
 
 ## Arquitetura em uma página
 
