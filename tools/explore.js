@@ -9,6 +9,11 @@
 // Metric vector order (fixed, documented): activityMean, activityStd,
 // spatialEntropy, compressibility, movingComponents, persistence,
 // lineageDiversity, stability. All in [0,1] (movingComponents scaled by 1/16).
+// Stage 14 (#15): --exp border|virus|physics|replication rides along as
+// `&exp=` on the page URL (default: unset → plain game). copyRate is a
+// TOP-LEVEL world/entry field (fraction of living cells whose full 24-bit
+// pack has >= 2 identical copies, mean over snapshots) — deliberately NOT in
+// METRIC_KEYS, which is fixed forever for archive compatibility.
 'use strict';
 
 const http = require('http');
@@ -42,6 +47,7 @@ const MOVING_SCALE = 16; // moving component count -> /16, clamped to 1
 const TAU_DEFAULT = 0.35; // novelty threshold (Euclidean distance in vec space)
 const FRAME_SIZE = 256;   // GIF frame size (canvas viewport)
 const LIN_IDS = 64;       // lineage ids 0..63 (0 = classic, 1..63 = stage 8)
+const EXP_NAMES = ['border', 'virus', 'physics', 'replication']; // ?exp= presets
 
 function findChromium() {
   const candidates = [
@@ -227,6 +233,26 @@ function computeMetrics(snapshots, size) {
     windows++;
   }
   const movingComponents = Math.min(1, (windows ? movingSum / windows : 0) / MOVING_SCALE);
+  // Stage 14: top-level copyRate (NOT in vec/METRIC_KEYS — archive format is
+  // fixed): mean over snapshots of the fraction of living cells whose full
+  // 24-bit pack (rule + lineage) shares its pack with >= 1 other living cell.
+  let copySum = 0;
+  for (const s of snapshots) {
+    const counts = new Map();
+    for (let i = 0; i < s.length; i += 4) {
+      if (!(s[i] & 1)) continue;
+      const pack = (s[i + 1] | (s[i + 2] << 8) | (s[i + 3] << 16)) >>> 0;
+      counts.set(pack, (counts.get(pack) || 0) + 1);
+    }
+    let living = 0;
+    let copied = 0;
+    for (const c of counts.values()) {
+      living += c;
+      if (c >= 2) copied += c;
+    }
+    copySum += living > 0 ? copied / living : 0;
+  }
+  const copyRate = snapshots.length ? copySum / snapshots.length : 0;
   return {
     vec: {
       activityMean: mean,
@@ -240,6 +266,7 @@ function computeMetrics(snapshots, size) {
     },
     finalPop,
     maxPop,
+    copyRate,
   };
 }
 
@@ -275,11 +302,13 @@ function vecToObject(vec) {
 // ---- Gallery ----
 
 function buildReproUrl(params) {
-  return `index.html?size=${params.size}&seed=${params.seed}&mut=${params.mut}`;
+  const exp = params.exp ? `&exp=${params.exp}` : '';
+  return `index.html?size=${params.size}&seed=${params.seed}&mut=${params.mut}${exp}`;
 }
 
 function entryId(params) {
-  return `s${params.size}_seed${params.seed}_mut${params.mut}_${params.genome}`;
+  const exp = params.exp ? `_exp${params.exp}` : '';
+  return `s${params.size}_seed${params.seed}_mut${params.mut}_${params.genome}${exp}`;
 }
 
 function writeGif(frames, dest) {
@@ -314,6 +343,7 @@ function parseArgs(argv) {
     pattern: 'soup',
     forceKeep: false,
     gif: true,
+    exp: null, // stage 14: ?exp= preset name (null = plain game)
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -330,6 +360,7 @@ function parseArgs(argv) {
     else if (a === '--pattern') opts.pattern = next();
     else if (a === '--force-keep') opts.forceKeep = true;
     else if (a === '--no-gif') opts.gif = false;
+    else if (a === '--exp') opts.exp = next();
     else throw new Error(`Unknown flag: ${a}`);
   }
   if (!Number.isFinite(opts.size) || opts.size < 8) throw new Error('--size must be >= 8');
@@ -337,6 +368,9 @@ function parseArgs(argv) {
   if (!Number.isFinite(opts.worlds) || opts.worlds < 1) throw new Error('--worlds must be >= 1');
   if (!['soup', 'still'].includes(opts.pattern)) throw new Error('--pattern must be soup|still');
   if (!['conway', 'highlife'].includes(opts.genome)) throw new Error('--genome must be conway|highlife');
+  if (opts.exp !== null && !EXP_NAMES.includes(opts.exp)) {
+    throw new Error(`--exp must be ${EXP_NAMES.join('|')}`);
+  }
   return opts;
 }
 
@@ -364,7 +398,8 @@ function fromB64(b64) {
 
 async function runWorld(browser, base, params, opts, ffmpeg) {
   const page = await browser.newPage({ viewport: { width: FRAME_SIZE, height: FRAME_SIZE } });
-  await page.goto(`${base}?size=${params.size}&seed=${params.seed}&mut=${params.mut}&sps=0.0001`);
+  const expQ = params.exp ? `&exp=${params.exp}` : '';
+  await page.goto(`${base}?size=${params.size}&seed=${params.seed}&mut=${params.mut}${expQ}&sps=0.0001`);
   await page.waitForFunction(() => !!window.__life);
   await page.evaluate(() => window.__life.setAuto(false));
   if (opts.pattern === 'still') {
@@ -434,7 +469,7 @@ async function main() {
     config: {
       size: opts.size, gens: opts.gens, worlds: opts.worlds,
       seedBase: opts.seedBase, mut: opts.mut, genome: opts.genome,
-      pattern: opts.pattern, tau: opts.tau,
+      pattern: opts.pattern, tau: opts.tau, exp: opts.exp,
     },
     worlds: [],
   };
@@ -446,6 +481,7 @@ async function main() {
       mut: opts.mut,
       genome: opts.genome,
       pattern: opts.pattern,
+      exp: opts.exp,
     };
     const { metrics, frames } = await runWorld(browser, base, params, opts, ffmpeg);
     const boring = isBoring(metrics);
@@ -462,6 +498,7 @@ async function main() {
       metrics: vecToObject(metrics.vec),
       finalPop: metrics.finalPop,
       maxPop: metrics.maxPop,
+      copyRate: metrics.copyRate,
       boring,
       distToArchive: dist,
       kept,
@@ -476,6 +513,7 @@ async function main() {
         metrics: record.metrics,
         finalPop: metrics.finalPop,
         maxPop: metrics.maxPop,
+        copyRate: metrics.copyRate,
         boring,
         gif: null,
         gifSkip: null,

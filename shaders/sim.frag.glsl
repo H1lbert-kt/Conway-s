@@ -32,6 +32,22 @@
 //            any living neighbor sits on niche-rich terrain (eco B >= NICH_T).
 //   ENERGY 1: a birth at p is vetoed when the location pool (eco G) < ENERGY_B_MIN.
 // Birth vetoes leave the cell dead with its ORIGINAL stored genome.
+// Stage 14 presets (EXP macro 0..4, injected like FREQ/... from ?exp=;
+// names mirrored in main.js EXP_PRESETS; CPU mirrors in tests/run.js
+// cpuStepGenomeMut(state,size,gen,seed,mutBp,exp)):
+//   EXP 1 border: no shader branch — the split-rule layout + stimuli are
+//        stamped by main.js (left Conway / right HighLife B6).
+//   EXP 2 virus:  a dead cell within popcount18 rule distance VIRUS_DIST of
+//        an adjacent living virus (lineage 63) gets its stored pack rewritten
+//        to the virus pack (contagion; heavy masks land at distance 10 and
+//        are immune). Mutated newborn lids stop at 62 (63 = virus).
+//   EXP 3 physics: births with n <= theta >> 5 are vetoed, where theta =
+//        round(255*sum/(count*18)) comes from the pre-step GPU-only
+//        reduction (uPhysSum/uPhysCount, 1x1 RGBA8 little-endian; no
+//        readback — rule 4). Determinism/bounds tested directly.
+//   EXP 4 replication: a birth is vetoed unless the hash-selected donor's
+//        full pack occurs at least REPLICATION_MIN times among the living
+//        neighbors (unqualified births need an existing copy).
 // Hash (mirrored bit-for-bit in tests/run.js hashCell):
 //   h  = seed
 //   h ^= x * 374761393;      h  = (h ^ (h >> 13)) * 1274126177
@@ -47,6 +63,10 @@ uniform int uWrap; // always 1 (toroidal); no non-wrapping path yet
 uniform int uGen;  // generation this step computes from (hash input)
 uniform uint uSeed; // hash seed (?seed= wiring, stage 8)
 uniform int uMutBp; // mutation in basis points (0..10000 from ?mut=); 0 = off
+#if EXP == 3
+uniform sampler2D uPhysSum;   // 1x1: sum of living rule popcounts (RGBA8 LE)
+uniform sampler2D uPhysCount; // 1x1: living cell count (RGBA8 LE)
+#endif
 out vec4 outColor;
 
 // Stage-10 constants (mirrored: main.js ENERGY_E0 + tests/run.js ECO).
@@ -73,6 +93,18 @@ const int AGE_Y_MIN = 1;
 const int AGE_DEATH_START = 127;
 const int AGE_DEATH_STEP_BP = 10;
 #endif
+// Stage 14 (issue #15) constants, mirrored in tests/run.js.
+#if EXP == 2
+// Rule distance below which an adjacent living virus (lineage 63) rewrites a
+// dead cell's stored pack: conway-vs-conway = 0 (susceptible), heavy masks
+// (g=0xF8, b=0xFC) land at 10 (immune); gap cells at 3 (rewritable, B0 gap).
+const int VIRUS_DIST = 6;
+#endif
+#if EXP == 4
+// A birth needs a hash-selected donor with at least this many identical full
+// packs among the living neighbors (the count includes the donor itself).
+const int REPLICATION_MIN = 2;
+#endif
 
 int byteOf(float f) { return int(f * 255.0 + 0.5); }
 
@@ -88,7 +120,7 @@ uint hashCell(uint x, uint y, uint g, uint s) {
   return h;
 }
 
-#if FREQ == 1
+#if FREQ == 1 || EXP == 2
 // popcount over 18 bits (GLSL ES 3.00 has no bitCount): nibble LUT.
 int popcount18(uint v) {
   const int lut[16] = int[16](0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4);
@@ -111,6 +143,21 @@ void main() {
   bool selfAlive = (r & 1) == 1;
 #if FREQ == 1
   uint selfPack18 = uint(g) | (uint(b) << 8) | ((uint(a) & 3u) << 16);
+#endif
+#if EXP == 3
+  // Stage 14 (?exp=physics): global rule-mass theta, decoded from the
+  // pre-step reduction (RGBA8 little-endian): sum = popcount18 of living
+  // rules, count = living cells. theta = round(255*sum/(count*18)) in
+  // [0,255] (sum <= count*18 structurally); count == 0 -> 0.
+  vec4 ps = texelFetch(uPhysSum, ivec2(0), 0);
+  vec4 pcC = texelFetch(uPhysCount, ivec2(0), 0);
+  uint physSum = uint(byteOf(ps.r)) | (uint(byteOf(ps.g)) << 8)
+    | (uint(byteOf(ps.b)) << 16) | (uint(byteOf(ps.a)) << 24);
+  uint physCnt = uint(byteOf(pcC.r)) | (uint(byteOf(pcC.g)) << 8)
+    | (uint(byteOf(pcC.b)) << 16) | (uint(byteOf(pcC.a)) << 24);
+  int thetaB = physCnt > 0u
+    ? int((float(physSum) * 255.0) / (float(physCnt) * 18.0) + 0.5)
+    : 0;
 #endif
   int n = 0;
   int livingCount = 0;
@@ -213,6 +260,20 @@ void main() {
       int pool = byteOf(texelFetch(uEco, p, 0).g);
       if (pool < ENERGY_B_MIN) veto = true;
 #endif
+#if EXP == 3
+      // Physics: thresholded birth gate (theta from the pre-step reduction).
+      if (n <= (thetaB >> 5)) veto = true;
+#endif
+#if EXP == 4
+      // Replication: unqualified births — the selected donor must already
+      // have at least REPLICATION_MIN identical copies (full pack) among the
+      // living neighbors; livingCount == 0 vetoes too (copies = 0).
+      int copies = 0;
+      for (int i = 0; i < livingCount; i++) {
+        if (livingGenomes[i] == genome) copies++;
+      }
+      if (copies < REPLICATION_MIN) veto = true;
+#endif
       if (veto) {
         alive = false;
         outR = 0;
@@ -225,7 +286,13 @@ void main() {
           if ((h % 10000u) < uint(uMutBp)) {
             uint bit = (h / 10000u) % 18u;
             genome ^= (1u << bit);
+#if EXP == 2
+            // Lineage 63 stays reserved for the virus (mutated lids stop at
+            // 62 under ?exp=virus so lid63 remains an unambiguous marker).
+            uint lid = 1u + ((h >> 9) % 62u);
+#else
             uint lid = 1u + ((h >> 9) % 63u);
+#endif
             outG = genome & 0xFFu;
             outB = (genome >> 8) & 0xFFu;
             outA = ((genome >> 16) & 0x03u) | (lid << 2);
@@ -240,5 +307,28 @@ void main() {
       }
     }
   }
+#if EXP == 2
+  // Stage 14 (?exp=virus): contagion — a post-rule DEAD cell within
+  // popcount18 rule distance VIRUS_DIST of the first (scan order) adjacent
+  // living virus (lineage 63) has its stored pack rewritten to the virus
+  // pack; distant stored rules (heavy masks, distance 10) are immune.
+  // Living cells are untouched — newborns inherit virus packs through the
+  // normal donor path.
+  if (!alive) {
+    for (int i = 0; i < livingCount; i++) {
+      uint lp = livingGenomes[i];
+      if (((lp >> 18) & 63u) == 63u) {
+        uint vr = lp & 0x3FFFFu;
+        uint mr = uint(g) | (uint(b) << 8) | ((uint(a) & 3u) << 16);
+        if (popcount18(vr ^ mr) < VIRUS_DIST) {
+          outG = lp & 0xFFu;
+          outB = (lp >> 8) & 0xFFu;
+          outA = ((lp >> 16) & 0x03u) | (63u << 2);
+          break;
+        }
+      }
+    }
+  }
+#endif
   outColor = vec4(float(outR) / 255.0, float(outG) / 255.0, float(outB) / 255.0, float(outA) / 255.0);
 }

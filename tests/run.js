@@ -149,7 +149,14 @@ function cpuStepGenome(state, size, gen, seed) {
 
 // Stage 8: CPU reference with mutation + full 24-bit lineage inheritance
 // (mirror of sim.frag; mutBp = ?mut= in basis points, 0 = stage-7 behavior).
-function cpuStepGenomeMut(state, size, gen, seed, mutBp) {
+// Stage 14 (#15): exp argument (default 0 = plain game) mirrors ?exp= presets:
+//   2 virus — dead-cell pack rewrite by adjacent lineage-63 (VIRUS_DIST rule
+//             distance) + mutation lids capped at 62;
+//   4 replication — birth veto unless the selected donor's pack occurs
+//             REPLICATION_MIN times among the living neighbors.
+//   1 border is stamping-only (expScenario); 3 physics has NO CPU mirror —
+//   covered by determinism + bounds + a sum/count crosscheck (plan decision).
+function cpuStepGenomeMut(state, size, gen, seed, mutBp, exp = 0) {
   const next = new Uint8Array(size * size * 4);
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
@@ -192,10 +199,21 @@ function cpuStepGenomeMut(state, size, gen, seed, mutBp) {
           let genome = living.length > 0
             ? living[h % living.length]
             : (g | (b << 8) | (a << 16)) >>> 0;
-          if (mutBp > 0 && (h % 10000) < mutBp) {
+          let veto = false;
+          if (exp === EXP_PRESETS.replication) {
+            let copies = 0;
+            for (let i = 0; i < living.length; i++) {
+              if (living[i] === genome) copies++;
+            }
+            if (copies < REPLICATION_MIN) veto = true;
+          }
+          if (veto) {
+            alive = false;
+            outR = 0;
+          } else if (mutBp > 0 && (h % 10000) < mutBp) {
             const bit = Math.floor(h / 10000) % 18;
             genome = (genome ^ (1 << bit)) >>> 0;
-            const lid = 1 + ((h >>> 9) % 63);
+            const lid = 1 + ((h >>> 9) % (exp === EXP_PRESETS.virus ? 62 : 63));
             outG = genome & 0xFF;
             outB = (genome >>> 8) & 0xFF;
             outA = ((genome >>> 16) & 0x03) | (lid << 2);
@@ -203,6 +221,23 @@ function cpuStepGenomeMut(state, size, gen, seed, mutBp) {
             outG = genome & 0xFF;
             outB = (genome >>> 8) & 0xFF;
             outA = (genome >>> 16) & 0xFF;
+          }
+        }
+      }
+      if (exp === EXP_PRESETS.virus && !alive) {
+        // Contagion (stage 14): first living virus in scan order whose rule
+        // distance to this cell's STORED rule is < VIRUS_DIST rewrites it.
+        for (let i = 0; i < living.length; i++) {
+          const lp = living[i];
+          if (((lp >>> 18) & 63) === 63) {
+            const vr = lp & 0x3FFFF;
+            const mr = g | (b << 8) | ((a & 3) << 16);
+            if (popcount18(vr ^ mr) < VIRUS_DIST) {
+              outG = lp & 0xFF;
+              outB = (lp >>> 8) & 0xFF;
+              outA = ((lp >>> 16) & 0x03) | (63 << 2);
+              break;
+            }
           }
         }
       }
@@ -231,6 +266,12 @@ const ECO = {
   AGE_DEATH_START: 127,
   AGE_DEATH_STEP_BP: 10,
 };
+
+// Stage 14 (#15): ?exp= preset values + sim.frag constants (mirrored in
+// main.js EXP_PRESETS and shaders/sim.frag.glsl).
+const EXP_PRESETS = { border: 1, virus: 2, physics: 3, replication: 4 };
+const VIRUS_DIST = 6;
+const REPLICATION_MIN = 2;
 
 function popcount18(v) {
   let c = 0;
@@ -513,6 +554,85 @@ const SCENE_PARTS = {
     .concat(CELLS.lwss.map(([x, y]) => [x + 53, y + 17]))
     .concat(CELLS.lwss.map(([x, y]) => [x + 45, y + 22])),
 };
+
+// Stage 14: mirror of main.js applyExpScenario (same size-relative bounds and
+// masks) — RGBA state in GL byte layout, used to validate the boot stamp and
+// to run the CPU reference from the exact same initial state.
+function expScenario(size, exp) {
+  const st = new Uint8Array(size * size * 4);
+  const half = size >> 1;
+  const set = (x, y) => {
+    const wx = ((x % size) + size) % size;
+    const wy = ((y % size) + size) % size;
+    const i = (wy * size + wx) * 4;
+    st[i] = 1;
+    st[i + 1] = wx >= half ? 0x48 : 0x08;
+    st[i + 2] = 0x0c;
+    st[i + 3] = 0;
+  };
+  if (exp === EXP_PRESETS.border) {
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const i = (y * size + x) * 4;
+        st[i + 1] = x >= half ? 0x48 : 0x08;
+        st[i + 2] = 0x0c;
+      }
+    }
+    const rings = [[-1, -1], [0, -1], [1, -1], [-1, 1], [0, 1], [1, 1]];
+    for (const cx of [Math.floor(size / 4), Math.floor((3 * size) / 4)]) {
+      for (const d of rings) set(cx + d[0], half + d[1]);
+    }
+    const glider = [[1, 0], [2, 1], [0, 2], [1, 2], [2, 2]];
+    for (const d of glider) set(half - 6 + d[0], 4 + d[1]);
+  } else if (exp === EXP_PRESETS.virus) {
+    const pA = size >> 3;
+    const pB = size >> 2;
+    const pC = half + (size >> 3);
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const i = (y * size + x) * 4;
+        const soup = ((x * 3 + y * 5) % 7) < 3;
+        if (x < pB) {
+          st[i] = soup ? 1 : 0;
+          st[i + 1] = 0x08;
+          st[i + 2] = 0x0c;
+          st[i + 3] = x >= pA ? 63 << 2 : 0;
+        } else if (x < pC) {
+          st[i + 1] = 0;
+          st[i + 2] = 0;
+        } else {
+          st[i] = soup ? 1 : 0;
+          st[i + 1] = 0xf8;
+          st[i + 2] = 0xfc;
+          st[i + 3] = 0x03;
+        }
+      }
+    }
+  } else if (exp === EXP_PRESETS.physics) {
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const i = (y * size + x) * 4;
+        const heavy = ((x + y) & 1) === 0;
+        st[i] = ((x * 3 + y * 5) % 7) < 3 ? 1 : 0;
+        st[i + 1] = heavy ? 0xf8 : 0x08;
+        st[i + 2] = heavy ? 0xfc : 0x0c;
+        st[i + 3] = heavy ? 0x03 : 0;
+      }
+    }
+  } else if (exp === EXP_PRESETS.replication) {
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const i = (y * size + x) * 4;
+        const rare = ((x * 7 + y * 3) % 11) === 0;
+        st[i] = ((x * 3 + y * 5) % 7) < 3 ? 1 : 0;
+        st[i + 1] = rare ? 0x0a : 0x08;
+        st[i + 2] = 0x0c;
+        st[i + 3] = 0;
+      }
+    }
+  }
+  return st;
+}
 
 const results = [];
 function record(name, pass, detail) {
@@ -2242,6 +2362,313 @@ async function main() {
     record('stage13: no page errors across the long-horizon probes',
       s13Errs.length === 0, s13Errs.join('; ') || undefined);
     await s13Page.close();
+  }
+
+  // ---- Stage 14: experiment presets (?exp=border|virus|physics|replication) ----
+  // Probe per issue #15: each preset boots clean, matches its CPU mirror
+  // bit-for-bit where one exists (border stamping, virus rewrite, replication
+  // veto via cpuStepGenomeMut), keeps physics GPU-only (reduce crosschecked
+  // against a CPU sum/count; zero loop readback), and is cross-load
+  // deterministic. Every readback below is validation-path (paused, batched)
+  // — never inside an auto-stepping frame. seed defaults to 0, mut to 0.
+  {
+    const s14Errs = [];
+    const mkPage = async (qs) => {
+      const p = await browser.newPage({ viewport: { width: 400, height: 300 } });
+      p.on('pageerror', (e) => s14Errs.push(qs + ': ' + String(e)));
+      await p.goto(`${base}?${qs}`, { timeout: 60000 });
+      await p.waitForFunction(() => !!window.__life || !!document.getElementById('error'));
+      const bootErr = await p.evaluate(() => (document.getElementById('error') || {}).textContent || null);
+      if (bootErr) throw new Error(`${qs} boot failed: ${bootErr}`);
+      await p.evaluate(() => window.__life.setAuto(false));
+      return p;
+    };
+    const raw = (p, s) => p.evaluate((n) => Array.from(window.__life.readRaw(0, 0, n, n)), s);
+    const eq = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
+
+    // -- border: stamp + B6 fingerprint, then 50-gen CPU parity --
+    {
+      const page = await mkPage('size=64&exp=border&sps=0.0001');
+      const at = (buf, x, y) => buf[(y * 64 + x) * 4] & 1;
+      const g0 = await raw(page, 64);
+      const m0 = expScenario(64, EXP_PRESETS.border);
+      await page.evaluate(() => window.__life.step(1));
+      const g1 = await raw(page, 64);
+      record('stage14: border — boot stamp matches expScenario; n==6 stimulus births only on the HighLife half at gen 1 (right center born, left center and ring corners dead)',
+        eq(g0, Array.from(m0))
+        && at(g0, 16, 32) === 0 && at(g0, 48, 32) === 0
+        && at(g0, 15, 31) === 1 && at(g0, 47, 31) === 1
+        && at(g1, 48, 32) === 1 && at(g1, 16, 32) === 0
+        && at(g1, 47, 31) === 0 && at(g1, 15, 31) === 0,
+        `stamp=${eq(g0, Array.from(m0))} gen1 r=${at(g1, 48, 32)} l=${at(g1, 16, 32)}`);
+      let cpu = Uint8Array.from(g0);
+      // The fingerprint step above already advanced the GPU to gen1 — sync the
+      // CPU (start-gen convention: cpuStep(state, gen) computes gen+1 from gen)
+      // and check gen1 before the parity loop.
+      cpu = cpuStepGenomeMut(cpu, 64, 0, 0, 0, EXP_PRESETS.border);
+      let parity = eq(g1, Array.from(cpu));
+      let gen = parity ? 1 : 0;
+      while (parity && gen < 50) {
+        cpu = cpuStepGenomeMut(cpu, 64, gen, 0, 0, EXP_PRESETS.border);
+        await page.evaluate(() => window.__life.step(1));
+        const gg = await raw(page, 64);
+        if (eq(gg, Array.from(cpu))) gen++;
+        else parity = false;
+      }
+      record('stage14: border — CPU mirror (stamp-only preset) matches GPU byte-for-byte for 50 gens',
+        parity && gen === 50, parity ? 'gens 1..50 identical' : `diverged at gen ${gen + 1}`);
+      await page.close();
+    }
+
+    // -- virus: stamp + contagion growth + immune zone, then 30-gen parity --
+    {
+      const page = await mkPage('size=128&exp=virus&sps=0.0001');
+      const S = 128;
+      const pA = S >> 3;
+      const pB = S >> 2;
+      const pC = (S >> 1) + (S >> 3);
+      const marked0 = (pB - pA) * S;
+      const zoneCount = (buf) => {
+        let virus = 0;
+        let immune = 0;
+        for (let y = 0; y < S; y++) {
+          for (let x = 0; x < S; x++) {
+            const lid = (buf[(y * S + x) * 4 + 3] >> 2) & 63;
+            if (lid !== 63) continue;
+            if (x < pC) virus++;
+            else if (x < S - 2) immune++; // x in [size-2, size) is wrap-adjacent
+          }
+        }
+        return { virus, immune };
+      };
+      let g = await raw(page, S);
+      const stampOk = eq(g, Array.from(expScenario(S, EXP_PRESETS.virus)));
+      const z0 = zoneCount(g);
+      let cpu = Uint8Array.from(g);
+      let parity = true;
+      let gen = 0;
+      let z5 = null;
+      let z10 = null;
+      let immuneMax = 0;
+      while (gen < 30) {
+        cpu = cpuStepGenomeMut(cpu, S, gen, 0, 0, EXP_PRESETS.virus);
+        await page.evaluate(() => window.__life.step(1));
+        gen++;
+        g = await raw(page, S);
+        if (!eq(g, Array.from(cpu))) {
+          parity = false;
+          break;
+        }
+        const z = zoneCount(g);
+        if (z.immune > immuneMax) immuneMax = z.immune;
+        if (gen === 5) z5 = z;
+        if (gen === 10) z10 = z;
+      }
+      record('stage14: virus — boot stamp matches expScenario; contagion grows through gen 10; the immune zone (x in [pC, size-2)) never takes lineage 63 through gen 30',
+        stampOk && z0.virus === marked0
+        && z5 !== null && z10 !== null
+        && z5.virus > marked0 && z10.virus > z5.virus && immuneMax === 0,
+        `stamp=${stampOk} marked0=${z0.virus}/${marked0} @5=${z5 ? z5.virus : '-'} @10=${z10 ? z10.virus : '-'} immuneMax=${immuneMax}`);
+      record('stage14: virus — CPU mirror (rewrite + lid clamp) matches GPU byte-for-byte for 30 gens',
+        parity && gen === 30, `diverged at gen ${gen}`);
+      await page.close();
+    }
+
+    // -- replication: stamp + parity + qualified-donor scan, divergence --
+    {
+      const page = await mkPage('size=64&exp=replication&sps=0.0001');
+      const S = 64;
+      const g0 = await raw(page, S);
+      const stampOk = eq(g0, Array.from(expScenario(S, EXP_PRESETS.replication)));
+      let g = g0;
+      let cpu = Uint8Array.from(g0);
+      let base = Uint8Array.from(g0); // plain Conway baseline (exp off)
+      let parity = true;
+      let scanOk = true;
+      let diverged = false;
+      let gen = 0;
+      for (; gen < 50; gen++) {
+        const prev = Uint8Array.from(g);
+        cpu = cpuStepGenomeMut(cpu, S, gen, 0, 0, EXP_PRESETS.replication);
+        base = cpuStepGenomeMut(base, S, gen, 0, 0);
+        await page.evaluate(() => window.__life.step(1));
+        g = await raw(page, S);
+        if (!eq(g, Array.from(cpu))) parity = false;
+        if (!diverged && !eq(g, Array.from(base))) diverged = true;
+        if (gen < 10) {
+          // Qualified-donor scan: every GPU birth must have a donor whose full
+          // pack already appears >= REPLICATION_MIN times among the living
+          // neighbors of that birth (hash mirrors hashCell, seed 0).
+          for (let y = 0; y < S && scanOk; y++) {
+            for (let x = 0; x < S && scanOk; x++) {
+              const si = (y * S + x) * 4;
+              if ((prev[si] & 1) || !(g[si] & 1)) continue;
+              const living = [];
+              for (let dy = -1; dy <= 1; dy++) {
+                for (let dx = -1; dx <= 1; dx++) {
+                  if (dx === 0 && dy === 0) continue;
+                  const qx = (x + dx + S) % S;
+                  const qy = (y + dy + S) % S;
+                  const qi = (qy * S + qx) * 4;
+                  if (prev[qi] & 1) {
+                    living.push((prev[qi + 1] | (prev[qi + 2] << 8) | (prev[qi + 3] << 16)) >>> 0);
+                  }
+                }
+              }
+              if (living.length === 0) {
+                scanOk = false;
+                break;
+              }
+              const donor = living[hashCell(x, y, gen, 0) % living.length];
+              let copies = 0;
+              for (let i = 0; i < living.length; i++) if (living[i] === donor) copies++;
+              if (copies < REPLICATION_MIN) scanOk = false;
+            }
+          }
+        }
+      }
+      record('stage14: replication — boot stamp matches expScenario; CPU mirror (copy veto) matches GPU for 50 gens; every birth in gens 0-9 has a qualified donor',
+        stampOk && parity && gen === 50 && scanOk,
+        `stamp=${stampOk} parity=${parity}@${gen} scan=${scanOk}`);
+      record('stage14: replication — states diverge from plain Conway on the identical stamp (veto bites)',
+        diverged, `diverged=${diverged}`);
+      await page.close();
+    }
+
+    // -- physics: GPU-only reduce crosschecked vs CPU + bounds + cross-load --
+    {
+      const p1 = await mkPage('size=64&exp=physics&sps=0.0001');
+      const g0 = await raw(p1, 64);
+      let cpuSum = 0;
+      let cpuCnt = 0;
+      for (let i = 0; i < g0.length; i += 4) {
+        if (!(g0[i] & 1)) continue;
+        cpuCnt++;
+        cpuSum += popcount18(g0[i + 1] | (g0[i + 2] << 8) | ((g0[i + 3] & 3) << 16));
+      }
+      await p1.evaluate(() => window.__life.step(1)); // phys now holds gen0 state
+      const ph1 = await p1.evaluate(() => window.__life.readPhys());
+      await p1.evaluate(() => window.__life.step(39));
+      const gA = await raw(p1, 64);
+      const phA = await p1.evaluate(() => window.__life.readPhys());
+      const p2 = await mkPage('size=64&exp=physics&sps=0.0001');
+      await p2.evaluate(() => window.__life.step(40));
+      const gB = await raw(p2, 64);
+      const phB = await p2.evaluate(() => window.__life.readPhys());
+      const inBounds = (p) => p && p.count > 0 && p.sum <= p.count * 18
+        && p.theta >= 0 && p.theta <= 255;
+      record('stage14: physics — reduce crosschecks the CPU sum/count at gen 0, theta in [0,255], cross-load identical at gen 40',
+        ph1 !== null && ph1.count === cpuCnt && ph1.sum === cpuSum
+        && inBounds(ph1) && inBounds(phA)
+        && eq(gA, gB) && JSON.stringify(phA) === JSON.stringify(phB),
+        `cpu=${cpuSum}/${cpuCnt} gpu=${ph1.sum}/${ph1.count} theta ${ph1.theta}->${phA.theta}/${phB.theta}`);
+      await p1.close();
+      await p2.close();
+    }
+
+    // -- physics: stamped mixed scene diverges from the no-feedback control --
+    {
+      // seed() flattens every genome to Conway (rule mass 3 -> theta 43 ->
+      // thr 1: the gate can never reach n==3, feedback inert by design), so
+      // use the preset's own 50/50 conway+heavy stamp. Control = the proven
+      // CPU ref WITHOUT feedback (physics has no CPU theta mirror — plan):
+      // identical per-cell masks, no gate; any divergence is the shader gate.
+      const p = await mkPage('size=64&exp=physics&sps=0.0001');
+      const g0 = await raw(p, 64);
+      let cpu = Uint8Array.from(g0);
+      await p.evaluate(() => window.__life.step(1)); // reduce ran on gen0 state
+      const ph0 = await p.evaluate(() => window.__life.readPhys());
+      let gG = await raw(p, 64);
+      cpu = cpuStepGenomeMut(cpu, 64, 0, 0, 0);
+      const d1 = !eq(gG, Array.from(cpu));
+      let gen = 1;
+      while (gen < 20) {
+        cpu = cpuStepGenomeMut(cpu, 64, gen, 0, 0);
+        await p.evaluate(() => window.__life.step(1));
+        gG = await raw(p, 64);
+        gen++;
+      }
+      const diffCells = countDiff(gG, Array.from(cpu));
+      record('stage14: physics — gen 0 theta >= 96 (thr >= 3: B3 blocked) and the stamped world diverges from the no-feedback control (same masks, CPU ref without the gate)',
+        ph0 !== null && ph0.theta >= 96 && ph0.theta <= 255 && d1 && diffCells > 0,
+        `theta0=${ph0 ? ph0.theta : '-'} gen1Diff=${d1} diffCells@${gen}=${diffCells}`);
+      await p.close();
+    }
+
+    // -- physics: no readback while auto-stepping (rule 4 hygiene) --
+    {
+      const hyg = await browser.newPage({ viewport: { width: 400, height: 300 } });
+      hyg.on('pageerror', (e) => s14Errs.push('hyg: ' + String(e)));
+      await hyg.addInitScript(() => {
+        window.__counters = { textures: 0, framebuffers: 0, readPixels: 0, drawArrays: 0 };
+        const W2 = WebGL2RenderingContext.prototype;
+        for (const [name, key] of [['createTexture', 'textures'], ['createFramebuffer', 'framebuffers']]) {
+          const orig = W2[name];
+          W2[name] = function () { window.__counters[key]++; return orig.apply(this, arguments); };
+        }
+        const origRead = W2.readPixels;
+        W2.readPixels = function () { window.__counters.readPixels++; return origRead.apply(this, arguments); };
+        const origDraw = W2.drawArrays;
+        W2.drawArrays = function () { window.__counters.drawArrays++; return origDraw.apply(this, arguments); };
+      });
+      await hyg.goto(`${base}?size=128&sps=120&exp=physics`, { timeout: 60000 });
+      await hyg.waitForFunction(() => !!window.__life);
+      const h0 = await hyg.evaluate(() => window.__life.generation());
+      await hyg.waitForTimeout(1500);
+      const h1 = await hyg.evaluate(() => window.__life.generation());
+      const c = await hyg.evaluate(() => window.__counters);
+      record('stage14: physics — zero readPixels while auto-stepping; allocs stable (2 state + mid + sum + count = 5 tex/fbo)',
+        h1 > h0 && c.readPixels === 0 && c.textures === 5 && c.framebuffers === 5,
+        `gen ${h0}->${h1} readPixels=${c.readPixels} tex=${c.textures} fbo=${c.framebuffers} draws=${c.drawArrays}`);
+      await hyg.close();
+    }
+
+    // -- all four presets: cross-load determinism (+ page-error gate) --
+    {
+      const det = [];
+      for (const name of ['border', 'virus', 'physics', 'replication']) {
+        const pA = await mkPage(`size=64&exp=${name}&sps=0.0001`);
+        const pB = await mkPage(`size=64&exp=${name}&sps=0.0001`);
+        await pA.evaluate(() => window.__life.step(15));
+        await pB.evaluate(() => window.__life.step(15));
+        const ra = await raw(pA, 64);
+        const rb = await raw(pB, 64);
+        det.push({ name, ok: eq(ra, rb) });
+        await pA.close();
+        await pB.close();
+      }
+      record('stage14: all four presets cross-load deterministic at gen 15; no page errors across the preset probes',
+        det.every((d) => d.ok) && s14Errs.length === 0,
+        det.map((d) => `${d.name}=${d.ok}`).join(' ') + (s14Errs.length ? ' errs=' + s14Errs.join('; ') : ''));
+    }
+
+    // -- explorer: --exp plumbing (config/params/entryId/reproUrl/copyRate) --
+    {
+      const expTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'explore14-'));
+      execFileSync('node', [
+        path.join(ROOT, 'tools', 'explore.js'),
+        '--size', '64', '--gens', '20', '--worlds', '1', '--seed-base', '3',
+        '--pattern', 'still', '--force-keep', '--no-gif', '--exp', 'physics',
+        '--archive', path.join(expTmp, 'archive.json'),
+        '--out', expTmp,
+      ], { cwd: ROOT, stdio: 'pipe' });
+      const runJ = JSON.parse(fs.readFileSync(path.join(expTmp, 'run.json'), 'utf8'));
+      const w = runJ.worlds[0];
+      const entry = JSON.parse(fs.readFileSync(path.join(expTmp, w.entry, 'metrics.json'), 'utf8'));
+      const bad = spawnSync('node', [
+        path.join(ROOT, 'tools', 'explore.js'), '--exp', 'nope',
+      ], { cwd: ROOT, stdio: 'pipe' });
+      record('stage14: explorer --exp smoke (config+params+entryId+reproUrl carry exp, top-level copyRate in [0,1]) and invalid --exp rejected',
+        runJ.config.exp === 'physics'
+        && w.params.exp === 'physics'
+        && typeof w.copyRate === 'number' && w.copyRate >= 0 && w.copyRate <= 1
+        && typeof entry.copyRate === 'number' && entry.copyRate === w.copyRate
+        && /_expphysics$/.test(w.entry)
+        && /&exp=physics$/.test(entry.reproUrl)
+        && bad.status !== 0,
+        `entry=${w.entry} copyRate=${w.copyRate} repro=${entry.reproUrl} badStatus=${bad.status}`);
+      fs.rmSync(expTmp, { recursive: true, force: true });
+    }
   }
 
   record(

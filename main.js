@@ -230,6 +230,9 @@ const GENOME_PRESETS = {
   highlife: { birth: 0x48, surv: 0x0c }, // B36/S23
 };
 const DEFAULT_GENOME = 'conway';
+// Stage 14: ?exp= preset names -> EXP macro values (sim.frag / reduce.frag are
+// specialized per preset). Mirrored as-is in tools/explore.js (EXP_PRESETS).
+const EXP_PRESETS = { border: 1, virus: 2, physics: 3, replication: 4 };
 
 async function main() {
   const sources = await Promise.all([
@@ -239,7 +242,7 @@ async function main() {
     loadText('shaders/eco.frag.glsl'),
   ]);
 
-  // Stage 10: parse the four URL flags FIRST — sim.frag is specialized at
+  // Stage 10: parse the URL flags FIRST — sim.frag is specialized at
   // compile time via injected #defines (uniform branches in the neighbor loop
   // cost ~40% in the software rasterizer even when never taken; measured).
   // Off flags preprocess their whole block away → default path compiles the
@@ -256,10 +259,18 @@ async function main() {
   const ecoOn = (ecoEnergy || ecoNiche) ? 1 : 0;
   const demoOn = flagOn('demo');
   let demoIdx = 0;
+  // Stage 14 (?exp=): four mutually exclusive presets, injected like the eco
+  // flags (0 = plain game). Names mirror EXP_PRESETS in tools/explore.js.
+  const expParam = searchParams.get('exp');
+  const expOn = Object.prototype.hasOwnProperty.call(EXP_PRESETS, expParam)
+    ? EXP_PRESETS[expParam] : 0;
   const simDefines = '#define FREQ ' + ecoFreq + '\n'
     + '#define ENERGY ' + ecoEnergy + '\n'
     + '#define NICHE ' + ecoNiche + '\n'
-    + '#define AGE ' + ecoAge + '\n';
+    + '#define AGE ' + ecoAge + '\n'
+    + '#define EXP ' + expOn + '\n';
+  // Stage 14: reduce shader only fetched under ?exp=physics.
+  const reduceSrc = expOn === 3 ? await loadText('shaders/reduce.frag.glsl') : null;
 
   // #version must stay first: splice the defines after it, not before.
   const specialize = (src) => {
@@ -270,6 +281,15 @@ async function main() {
   const simProgram = linkProgram(sources[0], specialize(sources[1]));
   const displayProgram = linkProgram(sources[0], sources[2]);
   const ecoProgram = linkProgram(sources[0], sources[3]);
+  // Stage 14 (?exp=physics): link + locate the reduction program only when the
+  // preset is active (rule 9: no dead weight on the default path).
+  const reduceProgram = reduceSrc ? linkProgram(sources[0], reduceSrc) : null;
+  const reduceLoc = reduceProgram ? {
+    uSrc: gl.getUniformLocation(reduceProgram, 'uSrc'),
+    uSrcSize: gl.getUniformLocation(reduceProgram, 'uSrcSize'),
+    uBlock: gl.getUniformLocation(reduceProgram, 'uBlock'),
+    uMode: gl.getUniformLocation(reduceProgram, 'uMode'),
+  } : null;
 
   const simLoc = {
     uState: gl.getUniformLocation(simProgram, 'uState'),
@@ -279,6 +299,8 @@ async function main() {
     uGen: gl.getUniformLocation(simProgram, 'uGen'),
     uSeed: gl.getUniformLocation(simProgram, 'uSeed'),
     uMutBp: gl.getUniformLocation(simProgram, 'uMutBp'),
+    uPhysSum: gl.getUniformLocation(simProgram, 'uPhysSum'),
+    uPhysCount: gl.getUniformLocation(simProgram, 'uPhysCount'),
   };
   const ecoLoc = {
     uMainOld: gl.getUniformLocation(ecoProgram, 'uMainOld'),
@@ -308,6 +330,55 @@ async function main() {
   let ecoWrite = 1;
   let generation = 0;
   let activeGenome = GENOME_PRESETS[DEFAULT_GENOME];
+
+  // Stage 14 (?exp=physics): GPU-only reduction chain — no readPixels in the
+  // loop (rule 4): sim.frag samples the two 1x1 results (uPhysSum/uPhysCount)
+  // written by reduce.frag before each step. State -> mid (count16|sum16 per
+  // block) -> sum32/count32. Allocated once per grid size (rule 5),
+  // freed/rebuilt in applyGridSize.
+  let phys = null;
+  function createTarget(w, h) {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
+      throw new Error('reduce framebuffer incomplete');
+    }
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    return { tex: tex, fbo: fbo };
+  }
+  function allocPhys() {
+    if (expOn !== 3) return;
+    // Grid sizes are powers of two and midW <= 128, so blockW = size/midW is
+    // an integer and midW*blockW covers the grid exactly.
+    const midW = Math.min(size, 128);
+    phys = {
+      midW: midW,
+      blockW: size / midW,
+      mid: createTarget(midW, midW),
+      sum: createTarget(1, 1),
+      count: createTarget(1, 1),
+    };
+  }
+  function freePhys() {
+    if (!phys) return;
+    gl.deleteFramebuffer(phys.mid.fbo);
+    gl.deleteTexture(phys.mid.tex);
+    gl.deleteFramebuffer(phys.sum.fbo);
+    gl.deleteTexture(phys.sum.tex);
+    gl.deleteFramebuffer(phys.count.fbo);
+    gl.deleteTexture(phys.count.tex);
+    phys = null;
+  }
+  allocPhys();
 
   let camX = 0;
   let camY = 0;
@@ -425,12 +496,45 @@ async function main() {
   }
 
   function stepOnce() {
+    if (expOn === 3) {
+      // Physics reduction on the PRE-step state (read target): three tiny
+      // draws, zero readback (rule 4). The sim pass below samples the 1x1
+      // results, so theta is computed before generation N executes.
+      gl.useProgram(reduceProgram);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.uniform1i(reduceLoc.uSrc, 0);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, phys.mid.fbo);
+      gl.viewport(0, 0, phys.midW, phys.midW);
+      gl.bindTexture(gl.TEXTURE_2D, textures[read]);
+      gl.uniform1i(reduceLoc.uSrcSize, size);
+      gl.uniform1i(reduceLoc.uBlock, phys.blockW);
+      gl.uniform1i(reduceLoc.uMode, 0);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, phys.sum.fbo);
+      gl.viewport(0, 0, 1, 1);
+      gl.bindTexture(gl.TEXTURE_2D, phys.mid.tex);
+      gl.uniform1i(reduceLoc.uSrcSize, phys.midW);
+      gl.uniform1i(reduceLoc.uBlock, phys.midW);
+      gl.uniform1i(reduceLoc.uMode, 1);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      gl.uniform1i(reduceLoc.uMode, 2);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, phys.count.fbo);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbos[write]);
     gl.viewport(0, 0, size, size);
     gl.useProgram(simProgram);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, textures[read]);
     gl.uniform1i(simLoc.uState, 0);
+    if (expOn === 3) {
+      gl.activeTexture(gl.TEXTURE2);
+      gl.bindTexture(gl.TEXTURE_2D, phys.sum.tex);
+      gl.uniform1i(simLoc.uPhysSum, 2);
+      gl.activeTexture(gl.TEXTURE3);
+      gl.bindTexture(gl.TEXTURE_2D, phys.count.tex);
+      gl.uniform1i(simLoc.uPhysCount, 3);
+    }
     if (ecoOn) {
       gl.activeTexture(gl.TEXTURE1);
       gl.bindTexture(gl.TEXTURE_2D, ecoTextures[ecoRead]);
@@ -599,6 +703,106 @@ async function main() {
     userInteracted = 1;
   }
 
+  // Stage 14 (?exp=): fixed deterministic scenario per preset, stamped at
+  // load OVER whatever ?seed/demo produced (presets are meant to be used
+  // alone, like ?demo). All bounds are size-relative so any grid size gets a
+  // valid scenario; uploadPatch wraps at the torus edges. Mirrored cell for
+  // cell in tests/run.js (expScenario).
+  function applyExpScenario() {
+    const half = size >> 1;
+    if (expOn === 1) {
+      // border: left Conway / right HighLife (B6 extra), an identical
+      // 6-neighbor stimulus on both sides (only the right half births from
+      // it) at x = size/4 and 3*size/4, plus a glider aimed across the seam.
+      for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+          const i = (y * size + x) * 4;
+          fullBuf[i] = 0;
+          fullBuf[i + 1] = x >= half ? 0x48 : 0x08;
+          fullBuf[i + 2] = 0x0c;
+          fullBuf[i + 3] = 0;
+        }
+      }
+      const set = (x, y) => {
+        const wx = ((x % size) + size) % size;
+        const wy = ((y % size) + size) % size;
+        const i = (wy * size + wx) * 4;
+        fullBuf[i] = 1;
+        fullBuf[i + 1] = wx >= half ? 0x48 : 0x08;
+        fullBuf[i + 2] = 0x0c;
+        fullBuf[i + 3] = 0;
+      };
+      const rings = [[-1, -1], [0, -1], [1, -1], [-1, 1], [0, 1], [1, 1]];
+      for (const cx of [Math.floor(size / 4), Math.floor((3 * size) / 4)]) {
+        for (const d of rings) set(cx + d[0], half + d[1]);
+      }
+      const glider = [[1, 0], [2, 1], [0, 2], [1, 2], [2, 2]];
+      for (const d of glider) set(half - 6 + d[0], 4 + d[1]);
+    } else if (expOn === 2) {
+      // virus: susceptible conway soup [0,pB) with the virus cluster marked
+      // (lineage 63) in [pA,pB); inert dead gap [pB,pC) (B0 masks — it can
+      // only fall via contagion rewrites, never spontaneous birth); immune
+      // heavy-mask soup (rule distance 10 >= VIRUS_DIST) at [pC,size).
+      const pA = size >> 3;
+      const pB = size >> 2;
+      const pC = half + (size >> 3);
+      for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+          const i = (y * size + x) * 4;
+          const soup = ((x * 3 + y * 5) % 7) < 3;
+          if (x < pB) {
+            fullBuf[i] = soup ? 1 : 0;
+            fullBuf[i + 1] = 0x08;
+            fullBuf[i + 2] = 0x0c;
+            fullBuf[i + 3] = x >= pA ? 63 << 2 : 0;
+          } else if (x < pC) {
+            fullBuf[i] = 0;
+            fullBuf[i + 1] = 0;
+            fullBuf[i + 2] = 0;
+            fullBuf[i + 3] = 0;
+          } else {
+            fullBuf[i] = soup ? 1 : 0;
+            fullBuf[i + 1] = 0xf8;
+            fullBuf[i + 2] = 0xfc;
+            fullBuf[i + 3] = 0x03;
+          }
+        }
+      }
+    } else if (expOn === 3) {
+      // physics: 50/50 Conway / heavy-mask soup — initial mean rule mass
+      // sits far above the birth threshold (theta ~113 >> 5 = 3 blocks B3)
+      // and drifts with the mix as it evolves.
+      for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+          const i = (y * size + x) * 4;
+          const heavy = ((x + y) & 1) === 0;
+          fullBuf[i] = ((x * 3 + y * 5) % 7) < 3 ? 1 : 0;
+          fullBuf[i + 1] = heavy ? 0xf8 : 0x08;
+          fullBuf[i + 2] = heavy ? 0xfc : 0x0c;
+          fullBuf[i + 3] = heavy ? 0x03 : 0;
+        }
+      }
+    } else if (expOn === 4) {
+      // replication: conway soup plus rare variant packs (g=0x0A) — wherever
+      // the hash picks a lone variant donor, the copy veto bites.
+      for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+          const i = (y * size + x) * 4;
+          const rare = ((x * 7 + y * 3) % 11) === 0;
+          fullBuf[i] = ((x * 3 + y * 5) % 7) < 3 ? 1 : 0;
+          fullBuf[i + 1] = rare ? 0x0a : 0x08;
+          fullBuf[i + 2] = 0x0c;
+          fullBuf[i + 3] = 0;
+        }
+      }
+    }
+    uploadPatch(0, 0, size, size, fullBuf);
+    fillEcoBuf((i) => fullBuf[i * 4] & 1);
+    uploadEco(ecoBuf);
+    fitView();
+    userInteracted = 1;
+  }
+
   function initSeed() {
     if (seedParam === null) return;
     seededFill(hashSeed);
@@ -606,6 +810,7 @@ async function main() {
 
   function applyGridSize(newSize) {
     if (newSize === size) return;
+    freePhys();
     for (let i = 0; i < 2; i++) {
       gl.deleteFramebuffer(fbos[i]);
       gl.deleteTexture(textures[i]);
@@ -633,6 +838,7 @@ async function main() {
       ecoBuf = new Uint8Array(size * size * 4);
     }
     window.__life.size = size;
+    allocPhys();
     fitView();
   }
 
@@ -819,6 +1025,24 @@ async function main() {
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       return buf;
     },
+    // Stage 14: physics reduction snapshot (sum/count of living rule mass,
+    // theta = round(255*sum/(count*18))). Validation path only — like
+    // readEco, never inside the render loop (the sim itself samples the
+    // 1x1 textures GPU-side; this is for tests).
+    readPhys: function () {
+      if (expOn !== 3 || !phys) return null;
+      const s = new Uint8Array(4);
+      const c = new Uint8Array(4);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, phys.sum.fbo);
+      gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, s);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, phys.count.fbo);
+      gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, c);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      const sum = s[0] + s[1] * 256 + s[2] * 65536 + s[3] * 16777216;
+      const count = c[0] + c[1] * 256 + c[2] * 65536 + c[3] * 16777216;
+      const theta = count > 0 ? Math.round((255 * sum) / (count * 18)) : 0;
+      return { sum: sum, count: count, theta: theta };
+    },
     view: function () {
       return [camX, camY, cellsX, cellsY()];
     },
@@ -854,6 +1078,7 @@ async function main() {
     applyDemoPhase(0);
     demoIdx = 1;
   }
+  if (expOn) applyExpScenario();
 
   function frame(now) {
     if (lastTime < 0) lastTime = now;
