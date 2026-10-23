@@ -1,6 +1,6 @@
 # Conway's Game of Life
 
-Simulação do Jogo da Vida de Conway (B3/S23) no navegador, feita para rodar **milhões de células a ~60 fps**: HTML + JavaScript (ES modules) + WebGL2, com a simulação inteira executando em shader (ping-pong textures), sem dependências externas e sem desenhar célula por célula na CPU.
+Simulação do Jogo da Vida de Conway (B3/S23) no navegador, feita para rodar **milhões de células a ~60 fps**: HTML + JavaScript (ES modules) + WebGL2, com a simulação inteira executando em shader (ping-pong textures), sem dependências externas e sem desenhar célula por célula na CPU. Fidelidade validada por **117 verificações automatizadas** headless (Playwright + Chromium), incluindo goldens canônicos do Gosper glider gun e paridade bit-a-bit GPU↔CPU por dezenas de gerações.
 
 ![Gosper glider gun rodando com HUD de fps/gen por segundo](assets/demo.gif)
 
@@ -49,6 +49,52 @@ Qualquer servidor estático serve (`npx serve`, `php -S`, etc.). Não há build,
 | **Arrastar** | Pan (com pintura desligada) ou pintura contínua (com pintura ligada). |
 | **Zoom** | Roda do mouse, centrado no cursor. |
 
+### O que experimentar primeiro
+
+| URL / comando | O que mostra |
+|---|---|
+| `http://localhost:8000/?demo=1&size=128&sps=30` | O modo demo curado: batalhas, methuselahs e osciladores em sequência automática (ciclo de 960 gerações). |
+| `?seed=demo&mut=0.05&freq=1&age=1` | Evolução estocástica com mutação, seleção por frequência e ciclo de vida — cores = linhagens. |
+| `?exp=virus&size=128` | Epidemia de regra: a frente de contágio avança ~1 célula/gen até a zona imune. |
+| `?exp=physics` | O mundo controla a própria física: θ alto bloqueia nascimentos de baixa ordem e o mundo pesado estabiliza. |
+| `?energy=1&niche=1&age=1&freq=1` | Ecologia completa (combo dos quatro mecanismos da Stage 10). |
+| `node tools/explore.js --size 64 --gens 120 --worlds 8 --mut 0.05 --exp physics` | Explorador de novidade headless: filtra mundos chatos e arquiva os interessantes com GIF + link de reprodução. |
+| `pnpm test` | A suíte inteira (117 verificações, ~10–15 min em SwiftShader). |
+
+## Arquitetura em uma página
+
+**Regra de ouro:** 1 texel = 1 célula; a simulação nunca roda na CPU; o loop de render nunca faz `readPixels` nem aloca.
+
+```
+uploads (pintura, seed, stamps, clear, randomize — entre passos, via texSubImage2D)
+        │
+        ▼
+┌─ stepOnce() ─────────────────────────────────────────────────────────┐
+│ [?exp=physics] reduce.frag ×3   state → mid(count16|sum16) → sum32,  │
+│                                 count32 (1×1; ZERO readback)          │
+│ sim.frag          state[read] → state[write]   regra B3/S23 por genoma │
+│                   + herança/mutação + gates de eco + vetos ?exp=       │
+│ [?energy|?niche]  eco.frag      main read/write + eco[read] → eco[write]│
+│                   ping-pong swap; generation++                         │
+└────────────────────────────────────────────────────────────────────────┘
+        │  (máx. N passos por frame, N = sps clampado ≤ 8 — anti spiral-of-death)
+        ▼
+display.frag   state → tela   (pan/zoom só via uniforms; NEAREST+REPEAT = toro contínuo)
+```
+
+| Passe | Shader | Quando roda | Custo |
+|---|---|---|---|
+| Redução (só `?exp=physics`) | `shaders/reduce.frag.glsl` | 3 draws antes de cada step: state inteiro → mid → 2× 1×1 | Existe só com o preset ligado; o consumo é via sampler, sem leitura |
+| Simulação | `shaders/sim.frag.glsl` | 1 draw full-grid por geração | O(size²) fragmentos — o gargalo dominante |
+| Eco (`?energy`/`?niche`) | `shaders/eco.frag.glsl` | 1 draw full-grid por geração, após o sim | mesmas texturas de estado + 1 par ping-pong extra |
+| Display | `shaders/display.frag.glsl` | 1 draw por frame (pode acumular N steps antes) | O(pixels de tela) — independe do grid |
+
+Três garantias estruturais (provadas por teste de higiene, não por contrato):
+
+1. **Especialização em tempo de compilação** — toda flag (`FREQ/ENERGY/NICHE/AGE/EXP`) vira `#define` injetado após `#version`; flag off ⇒ o bloco inteiro é pré-processado embora e o shader default compila o mesmo caminho de sempre (uniform *branch* dentro do loop de vizinhança custava ~40% do fps @4096² no rasterizador de software, mesmo nunca executado — medido).
+2. **Zero alocação no loop** — todos os buffers (`patchBuf`, `packBuf`, `fullBuf`, `ecoBuf`, `randomBuf`) e texturas/FBOs são alocados uma vez (ou na troca de grid, fora do loop).
+3. **Zero readback no loop** — `readPixels` acontece só no caminho de validação/teste e no HUD pausado de 1 Hz; a física da Stage 14 consome sua redução **na GPU** via sampler, nunca via leitura.
+
 ## Validação (fidelidade da regra)
 
 ```bash
@@ -76,6 +122,36 @@ O harness (`tests/run.js`, Playwright + Chromium headless) roda **117 verificaç
 - **Experimentos (Stage 14):** os quatro `?exp=` — **border**: stamping espelhado (`expScenario`) + fingerprint do estímulo n==6 no gen 1 (HighLife nasce no centro direito, Conway não, cantos do anel mortos) + paridade CPU↔GPU bit-exata por 50 gerações; **virus**: stamping exato (2048 células marcadas), contágio crescendo até gen 10, zona imune sem linhagem 63 até gen 30 (frente avançando ~1 célula/gen nas duas direções; colunas wrap-adjacentes excluídas) + paridade 30 gerações com o espelho de rewrite/lid-clamp; **replication**: stamping + paridade 50 gerações + **scan** provando que todo nascimento dos gens 0–9 tem doador com ≥2 cópias do pack + divergência do Conway puro; **physics**: redução GPU crosschecada contra soma/contagem CPU no gen 0 (byte-exato), `theta ∈ [0,255]` com `sum ≤ count·18`, determinismo cross-load no gen 40 (grade + snapshot físico), **divergência do controle sem-feedback** (mesma cena mista stampada, CPU ref sem o gate — `theta₀ = 113 ≥ 96` ⇒ `thr ≥ 3` bloqueia B3) já no gen 1 e no gen 20, e higiene de loop (0 `readPixels` em auto-stepping; 5 texturas/FBOs = estado+mid+sum+count). E os quatro presets cross-load determinísticos no gen 15, sem page errors. Explorador: `--exp` valida o nome, plumbeia `config`/`params`/`entryId`/`reproUrl` e reporta `copyRate ∈ [0,1]`; `--exp` inválido é rejeitado.
 
 O `readPixels` acontece **exclusivamente fora do stepping automático**: no caminho de validação/teste e no tick de 1 Hz do HUD **somente com a simulação pausada** — nunca em handlers de input nem durante o stepping (comprovado pelo teste de higiene: 0 `readPixels` durante a medição com auto-stepping ligado).
+
+### Como a fidelidade é provada (metodologia)
+
+Os 117 registros não são 117 testes iguais — são cinco **classes de prova**, reaproveitadas em toda stage:
+
+1. **Paridade GPU↔CPU (espelho)** — uma referência CPU em JS (`cpuStepGenomeMut` / `cpuStepEco` em `tests/run.js`) reimplementa a mesma regra, com o **mesmo hash bit-a-bit** (`Math.imul` = multiply-wrap de `uint`); compara-se o grid **byte-a-byte** (layout completo de 4 canais) por 30–50 gerações. Qualquer divergência de hash, ordem de scan ou máscara explode rápido — é o detector mais sensível do projeto.
+2. **Goldens canônicos** — valores de referência externa, não só CPU-vs-GPU: população **36/41/46** do Gosper gun nas gerações 0/30/60, offsets exatos dos gliders emitidos, diehard extinto **exatamente** no gen 130, pulsar p3, pentadecathlon p15 mínimo.
+3. **Higiene do loop** — protótipo do `WebGL2RenderingContext` instrumentado (`readPixels`, `createTexture`, `createFramebuffer`, `drawArrays` contados): prova 0 leituras e 0 alocações por frame, com a simulação a 120 sps.
+4. **Determinismo cross-load** — duas loads da mesma URL evoluem grade + estado auxiliar idênticos (byte-a-byte) até a geração N; `run.json` do explorador comparado entre execuções.
+5. **Invariantes e limites** — conservação `Σ(R+G) = E0 × size²` da energia a cada geração; `θ ∈ [0,255]` com `sum ≤ count·18` da física; crescimento monotônico da epidemia; zona imune nunca contaminada; divergência obrigatória de cada mecanismo contra o baseline (prova de que o mecanismo **faz algo**).
+
+Convenções que sustentam tudo: `seed`/`mut` default **0** nos testes (o caminho default fica bit-idêntico entre stages); os 49 testes originais + todos os goldens são **congelados** (nunca editados); mudanças de regra exigem espelho CPU atualizado no mesmo commit.
+
+### API de validação (`window.__life`)
+
+Hooks expostos pela página para o harness/headless — **todos pensados para rodar fora do loop de render** (pausado ou entre passos):
+
+| Hook | Assinatura | Uso |
+|---|---|---|
+| `setAuto(flag)` | `0`/`1` | Liga/desliga o stepping automático (testes rodam pausados). |
+| `step(n)` | `→ void` | Avança `n` gerações síncronas (caminho de validação; não passa pelo rAF). |
+| `read()` | `→ Uint8Array` | Canal 0 como 0/255 (contrato clássico do harness). |
+| `readRaw(x, y, w, h)` | `→ Uint8Array` | Bytes brutos do layout (R,G,B,A) da região — a base da paridade. |
+| `readEco()` | `→ Uint8Array \| null` | Textura de eco (canais R,G,B,A) ou `null` quando `?energy`/`?niche` off. |
+| `readPhys()` | `→ {sum, count, theta} \| null` | Snapshot da redução da Stage 14 (estado do início do passo — leia após ≥1 step). |
+| `readScreen()` | `→ Uint8Array` | Pixels da tela (o explorador usa para o GIF). |
+| `generation()` | `→ int` | Geração atual. |
+| `view()` | `→ [x, y, cellsX, cellsY]` | Estado da câmera. |
+| `seed(w, h, data)` / `stampBrush` / `stampPattern` / `clear` / `randomize` / `setGenome` | — | Mesmos caminhos dos botões da toolbar, chamáveis por script. |
+| `size` / `maxTextureSize` | propriedades | Dimensão atual do grid / limite da GPU. |
 
 ## Resultados medidos
 
@@ -132,7 +208,7 @@ Referência da Stage 5 (antes do byte layout, sob carga alta): display ~27 fps e
 - **Mutação e linhagens (Stage 8):** `?mut=` vira `mutBp` em pontos-base fixos (0–10000, clampado) — a comparação no shader é inteira (`h % 10000u < uMutBp`), sem floats cross-language. No nascimento, se a rolagem passa: `genome ^= 1u << ((h/10000u)%18u)` flipa 1 dos 18 bits de regra (domínio 0..17) e o recém-nascido recebe linhagem nova `1 + ((h>>9)%63)` em A bits2–7 (o XOR sempre muda o pack, então **todo evento de mutação recebe id novo**; sobreviventes e células stampadas **nunca** mudam de id). Mundo só com id 0 é bit-exato da Stage 7. O HUD, **só quando pausado**, mostra `| lineages: N` — contagem por um único `readPixels` full-grid + scan de 64 flags em JS, executada **exclusivamente no tick pausado de 1 Hz** (nunca durante o stepping automático e nunca dentro de handlers de input: a primeira sincronização de leitura depois de uma sessão de jogo drena a fila de software-GL acumulada — medido ~49 s em 4096² contra ~110 ms no estado estável — e bloquearia o dispatch de cliques; no tick, o valor aparece no máximo 1 s após pausar; o teste de higiene garante 0 `readPixels` com auto ligado).
 - **Pintura/patterns/seed** entram por `texSubImage2D` direto na textura viva (até 4 splits quando o retângulo cruza a borda), escrevendo o byte layout com as máscaras do **genoma selecionado** (viva = `(1, G, B, 0)`, morta = `(0, G, B, 0)`; Conway = `(1,8,12,0)` / `(0,8,12,0)`). Sem alocação por evento (`patchBuf`/`packBuf`/`fullBuf` alocados uma vez).
 - A próxima geração é **consumida do texel `read`** no passo seguinte — pinturas caem estritamente entre passos (single-threaded).
-- Hooks de validação: `__life.read()` devolve canal 0 como 0/255 (contrato do harness); `__life.readRaw()` devolve os bytes brutos do layout; `__life.readPhys()` devolve `{sum, count, theta}` da redução da Stage 14 (estado no início do passo — leia após ≥1 step) — todos só fora do loop.
+- Hooks de validação: a API completa `window.__life` (read/readRaw/readEco/readPhys/step/…) está documentada em “API de validação”, na seção Validação — todos os hooks rodam só fora do loop de render.
 
 ## Ecologia (Stage 10)
 
@@ -217,22 +293,26 @@ Labels: `stage` (toda issue de etapa), `planned` (planejada/em implementação),
 
 ### Issues por etapa
 
-| Etapa | Issue | Status |
+14 etapas entregues em 8 dias (2026-10-16 → 2026-10-23), 17 commits, suíte crescendo de 0 → 117 verificações.
+
+| Etapa | Issue | Fechada |
 |---|---|---|
-| 1 — Scaffold e contexto WebGL2 | #1 | fechada |
-| 2 — Núcleo de simulação GPU (B3/S23, ping-pong) | #2 | fechada |
-| 3 — Renderização e câmera (pan/zoom) | #3 | fechada |
-| 4 — Interação, patterns e controles | #4 | fechada |
-| 5 — Validação e performance em escala | #5 | fechada |
-| 6 — Formato RGBA8UI + modo Conway equivalente | #6 | fechada |
-| 7 — Genoma por célula + herança determinística | #7 | fechada |
-| 8 — Mutação + linhagens + cor | #8 | fechada |
-| 9 — Explorador de novidade (novelty search) | #9 | fechada |
-| 10 — Ecologia — seleção, energia, nicho, idade | #10 | fechada |
-| 11 — Biblioteca de padrões e cenas de batalha | #12 | fechada |
-| 12 — Modo demo curado (`?demo=1`) | #13 | fechada |
-| 13 — Ecologia — estabilidade em horizonte longo | #14 | fechada |
-| 14 — Experimentos de regras pouco exploradas | #15 | esta |
+| 1 — Scaffold e contexto WebGL2 | #1 | 2026-10-16 |
+| 2 — Núcleo de simulação GPU (B3/S23, ping-pong) | #2 | 2026-10-16 |
+| 3 — Renderização e câmera (pan/zoom) | #3 | 2026-10-16 |
+| 4 — Interação, patterns e controles | #4 | 2026-10-17 |
+| 5 — Validação e performance em escala | #5 | 2026-10-17 |
+| 6 — Formato RGBA8UI + modo Conway equivalente | #6 | 2026-10-17 |
+| 7 — Genoma por célula + herança determinística | #7 | 2026-10-18 |
+| 8 — Mutação + linhagens + cor | #8 | 2026-10-18 |
+| 9 — Explorador de novidade (novelty search) | #9 | 2026-10-19 |
+| 10 — Ecologia — seleção, energia, nicho, idade | #10 | 2026-10-20 |
+| 11 — Biblioteca de padrões e cenas de batalha | #12 | 2026-10-21 |
+| 12 — Modo demo curado (`?demo=1`) | #13 | 2026-10-21 |
+| 13 — Ecologia — estabilidade em horizonte longo | #14 | 2026-10-22 |
+| 14 — Experimentos de regras pouco exploradas | #15 | 2026-10-23 |
+
+Duas peculiaridades de numeração (histórico real, não bug): a partir da Stage 11 o **número da etapa anda uma posição atrás do número da issue** — o dono renumerou a fila quando decidiu o conteúdo do vídeo (#12 é a Stage 11, e assim por diante). E a issue **#11** (“Experimentos de regras pouco exploradas”) foi fechada como *not planned* quando o dono moveu o experimento para o FIM da fila — o pedido foi preservado verbatim na #15, que virou a Stage 14.
 
 ## Regras do projeto
 
@@ -241,11 +321,20 @@ Veja [AGENTS.md](./AGENTS.md) — stack fixa (HTML + JS + WebGL2, sem framework/
 ## Estrutura
 
 ```
-index.html        página + toolbar + HUD (sem framework)
-main.js           app WebGL2: context, sim pass, eco pass, reduce pass (stage 14), display pass, uploads, controles, cenas `?exp=`
-shaders/          sim.vert / sim.frag (genoma + mutação/linhagem + ecologia + experimentos via #if) / eco.frag (pool+campo) / reduce.frag (redução sum/count da stage 14) / display.frag
-tools/explore.js  explorador de novidade headless (stage 9, + `--exp`/`copyRate` da stage 14)
-tools/gallery/    saída do explorador (gitignorado: run.json, archive.json, achados)
-tests/run.js      harness headless (pnpm test)
-assets/           screenshot + gif usados neste README
+index.html          página + toolbar + HUD (sem framework; os <select> são a UI inteira)
+main.js             app WebGL2: contexto, passes (reduce/sim/eco/display), uploads,
+                    câmera/controles, cenas ?exp=/?demo=, hooks window.__life
+shaders/sim.vert    triângulo fullscreen via gl_VertexID (sem VBO)
+shaders/sim.frag    a regra: genoma por máscara + herança/mutação/linhagem +
+                    ecologia + experimentos, tudo sob #if de specialize
+shaders/eco.frag    passe de eco (energia conservada + campo de nicho); difere
+                    main-read vs main-write para achar nascimentos/mortes
+shaders/reduce.frag redução da Stage 14 (soma/contagem de massa de regra, GPU-only)
+shaders/display.frag estado → tela (pan/zoom via uniforms, HSL por linhagem)
+tools/explore.js    explorador de novidade headless (stage 9, + --exp/copyRate)
+tools/gallery/      saída do explorador (gitignorada: run.json, archive.json, achados)
+tests/run.js        harness headless (pnpm test): 117 records + as referências
+                    CPU (cpuStepGenomeMut/cpuStepEco) e cenas espelhadas (expScenario)
+package.json        só playwright-core (devDependency) + o script de teste
+assets/             screenshot + gif usados neste README
 ```
